@@ -2,6 +2,8 @@
 
 import math
 import io
+import os
+import sys
 
 import cv2
 import numpy as np
@@ -11,11 +13,14 @@ from PIL import Image, ImageOps
 DEFAULT_W = 190
 DEFAULT_H = 260
 DEFAULT_MAX_SIZE_KB = 20
-FACE_RATIO = 0.62          # 人脸在最终输出中的占比
-SHIFT_DOWN = 0.05           # 人脸中心下移比例（预留肩部空间）
+FACE_RATIO = 0.48          # 人脸在最终输出中的占比（保证全头约占 2/3）
+SHIFT_DOWN = 0.03           # 人脸中心下移比例（预留肩部空间）
 
-# OpenCV 级联分类器路径
-_CASCADE_DIR = cv2.data.haarcascades
+# OpenCV 级联分类器路径（兼容 PyInstaller 打包）
+if getattr(sys, 'frozen', False):
+    _CASCADE_DIR = sys._MEIPASS + os.sep
+else:
+    _CASCADE_DIR = cv2.data.haarcascades
 
 
 def _detect_face(img: Image.Image):
@@ -139,12 +144,31 @@ def process_image(img: Image.Image, target_w=DEFAULT_W, target_h=DEFAULT_H,
         rot_w, rot_h = orig_w, orig_h
     else:
         face_cx, face_cy, face_h, angle, _ = result
-        raw = img.rotate(angle, expand=True, resample=Image.BICUBIC)
-        rot_w, rot_h = raw.size
-        face_cx, face_cy = _rotate_point(
-            face_cx, face_cy, angle,
-            orig_w, orig_h, rot_w, rot_h,
-        )
+
+        if abs(angle) > 1.0:
+            # 旋转（不扩展），再适当放大让黑角离开裁切区域
+            raw = img.rotate(angle, expand=False, resample=Image.BICUBIC)
+            face_cx, face_cy = _rotate_point(
+                face_cx, face_cy, angle,
+                orig_w, orig_h, orig_w, orig_h,
+            )
+            angle_rad = math.radians(abs(angle))
+            cos_a = math.cos(angle_rad)
+            sin_a = math.sin(angle_rad)
+            aspect = max(orig_w / orig_h, orig_h / orig_w)
+            scale = 1.0 / (cos_a - sin_a * aspect)
+            if 1.01 < scale < 1.5:
+                new_size = (int(orig_w * scale), int(orig_h * scale))
+                raw = raw.resize(new_size, Image.LANCZOS)
+                rot_w, rot_h = new_size
+                face_cx *= scale
+                face_cy *= scale
+                face_h *= scale
+            else:
+                rot_w, rot_h = orig_w, orig_h
+        else:
+            raw = img.rotate(angle, expand=False, resample=Image.BICUBIC)
+            rot_w, rot_h = orig_w, orig_h
 
     crop_h = face_h / face_ratio
     crop_w = crop_h * target_w / target_h

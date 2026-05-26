@@ -26,8 +26,6 @@ PRESET_SIZES = {
     "自定义": None,
 }
 
-SIZE_KB_OPTIONS = ["20 KB", "30 KB", "50 KB", "100 KB", "200 KB"]
-
 MAX_PREVIEW_W = 380
 MAX_PREVIEW_H = 480
 
@@ -49,7 +47,10 @@ def _calc_display(img_size, max_w, max_h):
 
 
 def _parse_kb(text: str) -> int:
-    return int(text.split()[0])
+    try:
+        return int(text.strip().split()[0])
+    except (ValueError, TypeError):
+        return 20
 
 
 # ── 主窗口 ──────────────────────────────────────────────
@@ -68,39 +69,15 @@ class App(ctk.CTk):
         self.is_processing = False
         self.current_dims = (190, 260)
 
-        # 拖放支持
-        self._dnd_init()
-
         # 构建 UI
         self._built = False
         self._build_ui()
         self._built = True
 
         # 初始值
-        self.kb_var.set("20 KB")
+        self.kb_var.set("20")
         self.size_var.set("默认 190×260")
         self._on_change_size("默认 190×260")
-
-    # ── 拖放 ───────────────────────────────────────────
-
-    def _dnd_init(self):
-        self._dnd_ok = False
-        try:
-            import windnd
-            windnd.hook_dropfiles(self, func=self._dnd_hook)
-            self._dnd_ok = True
-        except ImportError:
-            pass
-
-    def _dnd_hook(self, paths):
-        files = []
-        for p in paths:
-            if isinstance(p, bytes):
-                p = p.decode("gbk")
-            if os.path.isfile(p) and os.path.splitext(p)[1].lower() in SUPPORTED_EXT:
-                files.append(p)
-        if files:
-            self._add_files(files)
 
     # ── 构建 UI ────────────────────────────────────────
 
@@ -152,16 +129,16 @@ class App(ctk.CTk):
         ctk.CTkLabel(f, text="px").pack(side="left")
 
         ctk.CTkLabel(f, text="  最大文件:", font=ctk.CTkFont(size=13)).pack(side="left", padx=(20, 2))
-        self.kb_var = ctk.StringVar()
-        self.kb_menu = ctk.CTkOptionMenu(
-            f, values=SIZE_KB_OPTIONS,
-            variable=self.kb_var, width=85, dynamic_resizing=False,
-        )
-        self.kb_menu.pack(side="left", padx=2)
+        self.kb_var = ctk.StringVar(value="20")
+        self.kb_entry = ctk.CTkEntry(f, width=70, textvariable=self.kb_var)
+        self.kb_entry.pack(side="left", padx=2)
+        ctk.CTkLabel(f, text="KB").pack(side="left")
 
         # 自定义尺寸输入变更时更新预览
         self.cw_entry.bind("<KeyRelease>", self._on_custom_keyup)
         self.ch_entry.bind("<KeyRelease>", self._on_custom_keyup)
+        self.kb_entry.bind("<KeyRelease>", lambda e: self._update_preview()
+                           if self.selected_idx >= 0 else None)
 
     def _build_main(self):
         f = ctk.CTkFrame(self)
@@ -176,7 +153,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(left, text="图片列表",
                       font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(8, 0))
-        hint = "支持拖放图片到窗口" if self._dnd_ok else "点击「添加图片」按钮"
+        hint = "点击「添加图片」按钮添加图片"
         ctk.CTkLabel(left, text=hint, font=ctk.CTkFont(size=11),
                       text_color="gray").pack()
 

@@ -17,7 +17,7 @@
 pip install -r requirements.txt
 ```
 
-依赖：Pillow, opencv-python, customtkinter, windnd（可选，用于拖放支持）
+依赖：Pillow, opencv-python, customtkinter
 
 ## 使用
 
