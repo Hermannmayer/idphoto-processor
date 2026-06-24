@@ -61,8 +61,18 @@ python batch.py input_dir/ -o output_dir/ --overwrite
 ## 项目结构
 
 ```
-├── process.py     # 核心处理：人脸检测 → 旋转校正 → 裁切 → 压缩
-├── batch.py       # 命令行批量处理
-├── gui.py         # 图形界面（CustomTkinter）
-└── requirements.txt
+├── process.py              # 核心处理：人脸检测 → 旋转校正 → 裁切 → 压缩
+├── batch.py                # 命令行批量处理
+├── gui.py                  # 图形界面（CustomTkinter）
+├── requirements.txt
+└── idphoto-processor.spec  # PyInstaller 打包配置
 ```
+
+## 打包为 EXE
+
+```bash
+pip install pyinstaller
+pyinstaller idphoto-processor.spec
+```
+
+生成的可执行文件在 `dist/idphoto-processor.exe`。

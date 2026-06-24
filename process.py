@@ -18,7 +18,7 @@ SHIFT_DOWN = 0.03           # 人脸中心下移比例（预留肩部空间）
 
 # OpenCV 级联分类器路径（兼容 PyInstaller 打包）
 if getattr(sys, 'frozen', False):
-    _CASCADE_DIR = sys._MEIPASS + os.sep
+    _CASCADE_DIR = sys._MEIPASS + os.sep + "cv2" + os.sep + "data" + os.sep
 else:
     _CASCADE_DIR = cv2.data.haarcascades
 
@@ -71,9 +71,17 @@ def _detect_face(img: Image.Image):
             le_x = fx + right_candidates[-1][0] + right_candidates[-1][2] / 2
             le_y = fy + right_candidates[-1][1] + right_candidates[-1][3] / 2
 
-            keypoints = [(re_x, re_y), (le_x, le_y)]  # (右眼, 左眼)
+            # 合理性检查：两只眼睛应在人脸框上半部分
+            face_bottom_half = fy + fh * 0.5
+            eyes_in_upper_half = (re_y < face_bottom_half and le_y < face_bottom_half)
 
-            angle_deg = math.degrees(math.atan2(le_y - re_y, le_x - re_x))
+            # 合理性检查：两只眼睛的垂直间距不能太大（< 人脸高度的 15%）
+            eye_vertical_gap = abs(le_y - re_y)
+            vertical_gap_ok = eye_vertical_gap < fh * 0.15
+
+            if eyes_in_upper_half and vertical_gap_ok:
+                keypoints = [(re_x, re_y), (le_x, le_y)]  # (右眼, 左眼)
+                angle_deg = math.degrees(math.atan2(le_y - re_y, le_x - re_x))
 
     info = {
         "bbox": (fx, fy, fw, fh),
@@ -108,7 +116,7 @@ def _compress_jpeg(img: Image.Image, max_bytes: int,
         mid = (lo + hi) // 2
         buf.seek(0)
         buf.truncate()
-        img.save(buf, format="JPEG", quality=mid, optimize=True)
+        img.save(buf, format="JPEG", quality=mid, optimize=True, exif=b"")
         size = buf.tell()
         if size <= max_bytes:
             best = buf.getvalue()
@@ -124,7 +132,7 @@ def _compress_jpeg(img: Image.Image, max_bytes: int,
     new_h = max(1, int(target_h * scale))
     smaller = img.resize((new_w, new_h), Image.LANCZOS)
     buf = io.BytesIO()
-    smaller.save(buf, format="JPEG", quality=1, optimize=True)
+    smaller.save(buf, format="JPEG", quality=1, optimize=True, exif=b"")
     return buf.getvalue()
 
 
@@ -132,6 +140,14 @@ def process_image(img: Image.Image, target_w=DEFAULT_W, target_h=DEFAULT_H,
                   face_ratio=FACE_RATIO, shift_down=SHIFT_DOWN) -> Image.Image:
     """处理单张图片，返回符合要求的 Image 对象。"""
     img = ImageOps.exif_transpose(img) or img
+
+    # RGBA → RGB（JPEG 不支持透明度），透明部分填充白色
+    if img.mode == "RGBA":
+        background = Image.new("RGB", img.size, (255, 255, 255))
+        background.paste(img, mask=img.split()[3])  # alpha 通道作蒙版
+        img = background
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
     orig_w, orig_h = img.size
 
     result = _detect_face(img)
@@ -146,28 +162,16 @@ def process_image(img: Image.Image, target_w=DEFAULT_W, target_h=DEFAULT_H,
         face_cx, face_cy, face_h, angle, _ = result
 
         if abs(angle) > 1.0:
-            # 旋转（不扩展），再适当放大让黑角离开裁切区域
-            raw = img.rotate(angle, expand=False, resample=Image.BICUBIC)
+            # 旋转并扩展画布，白边填充避免黑角
+            raw = img.rotate(angle, expand=True, resample=Image.BICUBIC,
+                             fillcolor=(255, 255, 255))
+            rot_w, rot_h = raw.size
             face_cx, face_cy = _rotate_point(
                 face_cx, face_cy, angle,
-                orig_w, orig_h, orig_w, orig_h,
+                orig_w, orig_h, rot_w, rot_h,
             )
-            angle_rad = math.radians(abs(angle))
-            cos_a = math.cos(angle_rad)
-            sin_a = math.sin(angle_rad)
-            aspect = max(orig_w / orig_h, orig_h / orig_w)
-            scale = 1.0 / (cos_a - sin_a * aspect)
-            if 1.01 < scale < 1.5:
-                new_size = (int(orig_w * scale), int(orig_h * scale))
-                raw = raw.resize(new_size, Image.LANCZOS)
-                rot_w, rot_h = new_size
-                face_cx *= scale
-                face_cy *= scale
-                face_h *= scale
-            else:
-                rot_w, rot_h = orig_w, orig_h
         else:
-            raw = img.rotate(angle, expand=False, resample=Image.BICUBIC)
+            raw = img
             rot_w, rot_h = orig_w, orig_h
 
     crop_h = face_h / face_ratio
