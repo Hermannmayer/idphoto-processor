@@ -9,7 +9,24 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageOps
 
-from process import process_image_to_bytes, process_image, detect_face
+from process import process_image_to_bytes, process_image, detect_face, compress_to_bytes
+
+# 标记：某图已检测过但无人脸（缓存用）
+_NO_FACE = object()
+
+MAX_PREVIEW_SRC = 900  # 预览处理/绘制的源图最长边上限（大幅提速，构图与批量一致）
+
+
+def _scale_face_result(face_r, sc):
+    """把 detect_face() 的结果按 sc 等比缩放到降采样图上（构图不变）。"""
+    if face_r is None:
+        return None
+    cx, cy, fh, ang, info = face_r
+    info2 = {k: tuple(v * sc for v in info[k]) for k in ("bbox", "head", "eyes", "mouth")}
+    info2["top_y"] = info["top_y"] * sc
+    info2["chin_y"] = info["chin_y"] * sc
+    info2["keypoints"] = [(x * sc, y * sc) for x, y in info.get("keypoints", [])]
+    return (cx * sc, cy * sc, fh * sc, ang, info2)
 
 # ── 常量 ────────────────────────────────────────────────
 
@@ -68,6 +85,8 @@ class App(ctk.CTk):
         self.selected_idx = -1
         self.is_processing = False
         self.current_dims = (190, 260)
+        self.face_cache: dict[str, object] = {}  # path → detect_face() 结果或 _NO_FACE
+        self._item_frames: list = []
 
         # 构建 UI
         self._built = False
@@ -300,6 +319,7 @@ class App(ctk.CTk):
 
     def _load_dir(self, path):
         self.image_infos.clear()
+        self.face_cache.clear()
         p = Path(path)
         for f in sorted(p.iterdir(), key=lambda x: x.name):
             if f.suffix.lower() in SUPPORTED_EXT and f.is_file():
@@ -316,6 +336,7 @@ class App(ctk.CTk):
 
     def _clear(self):
         self.image_infos.clear()
+        self.face_cache.clear()
         self.selected_idx = -1
         self._refresh_list()
         self._clear_preview()
@@ -329,6 +350,7 @@ class App(ctk.CTk):
     def _refresh_list(self):
         for w in self.list_scroll.winfo_children():
             w.destroy()
+        self._item_frames = []
 
         if not self.image_infos:
             ctk.CTkLabel(self.list_scroll, text="暂无图片",
@@ -338,10 +360,18 @@ class App(ctk.CTk):
         for i, info in enumerate(self.image_infos):
             self._make_item(i, info)
 
+    def _set_highlight(self):
+        """仅更新选中高亮，避免每次点击都重建整列控件."""
+        for i, item in enumerate(self._item_frames):
+            item.configure(fg_color=("#d0e4f5", "#2a4a6a") if i == self.selected_idx
+                           else getattr(item, "_default_fg", None))
+
     def _make_item(self, idx, info):
         item = ctk.CTkFrame(self.list_scroll)
         item.pack(fill="x", padx=2, pady=1)
         item.grid_columnconfigure(2, weight=1)
+        item._default_fg = item.cget("fg_color")   # 记住默认色，供高亮切换恢复
+        self._item_frames.append(item)
 
         if idx == self.selected_idx:
             item.configure(fg_color=("#d0e4f5", "#2a4a6a"))
@@ -372,7 +402,7 @@ class App(ctk.CTk):
         if idx < 0 or idx >= len(self.image_infos):
             return
         self.selected_idx = idx
-        self._refresh_list()
+        self._set_highlight()
         self._update_nav()
         self._update_preview()
 
@@ -418,31 +448,49 @@ class App(ctk.CTk):
             self.orig_lbl.configure(text=f"无法加载: {e}")
             return
 
-        # 原图 + 人脸框
-        orig_disp = pil.copy()
-        face_r = detect_face(pil)
+        # 预览统一在 ≤MAX_PREVIEW_SRC 的图上完成（坐标按比例缩放；构图与批量一致）
+        longest = max(pil.size)
+        if longest > MAX_PREVIEW_SRC:
+            sc = MAX_PREVIEW_SRC / longest
+            disp = pil.resize((round(pil.width * sc), round(pil.height * sc)), Image.LANCZOS)
+        else:
+            sc = 1.0
+            disp = pil
+
+        # 原图 + 人脸框（复用缓存的人脸检测，避免每次预览重复算）
+        orig_disp = disp.copy()
+        cached = self.face_cache.get(info["path"])
+        if cached is None:
+            try:
+                cached = detect_face(pil) or _NO_FACE
+            except Exception:
+                cached = _NO_FACE  # 模型缺失等异常不阻断预览
+            self.face_cache[info["path"]] = cached
+        face_r = None if cached is _NO_FACE else cached
         if face_r:
             _, _, _, _, det = face_r
             draw = ImageDraw.Draw(orig_disp)
-            bx, by, bw, bh = det["bbox"]
-            draw.rectangle([bx, by, bx + bw, by + bh], outline="#00DD00", width=3)
-            for px, py in det["keypoints"]:
-                draw.ellipse([px - 4, py - 4, px + 4, py + 4], fill="#FF3333")
+            hx1, hy1, hx2, hy2 = [v * sc for v in (det.get("head") or det["bbox"])]
+            draw.rectangle([hx1, hy1, hx2, hy2], outline="#00DD00", width=3)
+            r = max(2, round(4 * sc))
+            for px, py in det.get("keypoints", []):
+                draw.ellipse([px * sc - r, py * sc - r, px * sc + r, py * sc + r], fill="#FF3333")
 
-        ds = _calc_display(pil.size, MAX_PREVIEW_W, MAX_PREVIEW_H)
+        ds = _calc_display(disp.size, MAX_PREVIEW_W, MAX_PREVIEW_H)
         ctk_img = ctk.CTkImage(orig_disp, size=ds)
         self.orig_lbl.configure(image=ctk_img, text="")
         self.orig_info.configure(
             text=f"{info['name']}  |  {pil.width}×{pil.height}  |  {_fmt_size(info['size'])}")
 
-        # 处理后
+        # 处理后（在降采样图上处理，构图与批量一致）
         try:
             # 每次都直接从当前来源读取尺寸（修复自定义尺寸不生效的 bug）
             tw, th = self._read_dims()
             max_kb = _parse_kb(self.kb_var.get())
-            processed = process_image(pil, target_w=tw, target_h=th)
-            data = process_image_to_bytes(pil, target_w=tw, target_h=th,
-                                          max_size_kb=max_kb)
+            processed = process_image(disp, target_w=tw, target_h=th,
+                                      face_result=_scale_face_result(face_r, sc))
+            data = compress_to_bytes(processed, max_size_kb=max_kb,
+                                     target_w=tw, target_h=th)
             ds2 = _calc_display((tw, th), MAX_PREVIEW_W, MAX_PREVIEW_H)
             ctk_p = ctk.CTkImage(processed, size=ds2)
             self.proc_lbl.configure(image=ctk_p, text="")
@@ -496,6 +544,18 @@ class App(ctk.CTk):
         self.current_dims = (tw, th)
 
         Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+        # 预检：输出文件夹是否可写（避免整批 Permission denied）
+        try:
+            probe = Path(out_dir) / ".write_test"
+            probe.write_bytes(b"")
+            probe.unlink(missing_ok=True)
+        except OSError:
+            messagebox.showwarning(
+                "输出文件夹无法写入",
+                f"无法向「{out_dir}」写入文件（可能是只读 / OneDrive 同步 / 权限问题）。\n"
+                f"请换一个普通文件夹（例如在桌面上新建一个空文件夹）后再试。")
+            return
 
         self.is_processing = True
         self.go_btn.configure(text="处理中…", state="disabled")

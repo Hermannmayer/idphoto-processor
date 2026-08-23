@@ -1,0 +1,50 @@
+name: build-release
+
+# 触发方式：
+#   - 推 master 分支 → 编译 exe，作为 Actions 工件（Actions 页面可下载）
+#   - 推 v* 标签（如 v1.0.0）→ 编译 exe 并自动创建 GitHub Release，别人可直接下载
+#   - 手动：Actions → build-release → Run workflow
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build EXE
+        run: pyinstaller --clean --noconfirm idphoto-processor.spec
+
+      - name: Upload artifact (Actions 页面可直接下载)
+        uses: actions/upload-artifact@v4
+        with:
+          name: idphoto-processor
+          path: dist/idphoto-processor.exe
+
+      - name: Publish GitHub Release (打 v* 标签时)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/idphoto-processor.exe
+          tag_name: ${{ github.ref_name }}
+          name: idphoto-processor ${{ github.ref_name }}
+          body: |
+            证件照批量处理工具 - 自动构建版。
+
+            - 版本：`${{ github.ref_name }}`（由 git 标签决定，实现版本控制）
+            - 使用说明见仓库 README。
+          draft: false
+          prerelease: false

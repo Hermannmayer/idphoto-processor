@@ -5,27 +5,12 @@ PyInstaller spec for idphoto-processor (GUI).
 关键处理：
 1. collect_all('numpy') — 避免 "Importing the numpy C-extensions failed"
 2. collect_all('PIL') / collect_all('customtkinter') — 自动收集插件和动态导入
-3. opencv haarcascade XML 显式打包
+3. models/ 目录 — YuNet 人脸检测 ONNX 模型
 """
 from PyInstaller.utils.hooks import collect_all
-from pathlib import Path
-import site
-
-# ── opencv 级联分类器数据 ──
-# 遍历所有 site-packages 找到 cv2/data 目录
-_cv2_data_dir = None
-for p in site.getsitepackages():
-    xml_files = sorted(Path(p).glob("cv2/data/haarcascade_*.xml"))
-    if xml_files:
-        _cv2_data_dir = str(xml_files[0].parent)
-        break
-if not _cv2_data_dir:
-    # 备用：从包自身查找
-    import cv2
-    _cv2_data_dir = cv2.data.haarcascades
 
 datas = [
-    (_cv2_data_dir, "cv2/data"),
+    ("models", "models"),  # YuNet 人脸检测 ONNX 模型
 ]
 binaries = []
 hiddenimports = [
