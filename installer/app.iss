@@ -1,4 +1,4 @@
-; 证件照批量处理工具 —— Inno Setup 安装脚本
+﻿; 证件照批量处理工具 —— Inno Setup 安装脚本
 ;
 ; 由 .github/workflows/release.yml 调用：
 ;   ISCC.exe /DAppVersion=<版本号> installer\app.iss

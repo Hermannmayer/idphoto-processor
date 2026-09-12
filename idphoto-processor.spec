@@ -76,7 +76,9 @@ def _drop(entries):
 _before = len(a.binaries) + len(a.datas)
 a.binaries = _drop(a.binaries)
 a.datas = _drop(a.datas)
-print("[spec] 剔除 %d 个无用条目（ffmpeg 视频库 / AVIF 编解码）"
+# 注意：这里的输出必须是纯 ASCII —— PyInstaller 在 Windows 控制台（英文版是 cp1252）
+# 里 exec 本文件，中文 print 会直接 UnicodeEncodeError 让整个构建失败
+print("[spec] dropped %d unused entries (ffmpeg video lib / AVIF codec)"
       % (_before - len(a.binaries) - len(a.datas)))
 
 pyz = PYZ(a.pure)
