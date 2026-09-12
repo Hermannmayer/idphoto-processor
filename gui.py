@@ -1,15 +1,61 @@
 #!/usr/bin/env python3
 """证件照批量处理 GUI"""
 
+import ctypes
 import os
+import sys
 import threading
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
+# ── 单实例守卫 ──────────────────────────────────────────
+# 必须放在 customtkinter / process（opencv）等重导入之前：安装版启动时这些导入
+# 要花明显时间，低配机上客户等不及会反复双击图标，从而开出多个窗口各处理一遍。
+# 这里在最早的时机拦掉重复启动，第二个实例几乎零开销退出。
+_MUTEX_NAME = "IDPhotoProcessor_SingleInstance_v1"
+_WINDOW_TITLE = "证件照批量处理工具"
+_mutex_handle = None  # 必须由模块级变量持有到进程结束，否则互斥体提前释放
+
+
+def _ensure_single_instance():
+    """已有实例在运行时，把它的窗口切到前台并结束本进程。"""
+    global _mutex_handle
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    except Exception:
+        return  # 非 Windows 或调用失败：不阻断启动
+
+    _mutex_handle = kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+    if not _mutex_handle or kernel32.GetLastError() != 183:  # ERROR_ALREADY_EXISTS
+        return
+
+    try:
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        user32.FindWindowW.restype = ctypes.c_void_p
+        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        hwnd = user32.FindWindowW(None, _WINDOW_TITLE)
+        if hwnd:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+        else:
+            # 第一个实例还在启动中（低配机上这段窗口期很长），
+            # 明确告诉客户"已经在启动了"，避免他以为没反应而继续点。
+            # MB_SETFOREGROUND 让提示框一定跳到前台。
+            user32.MessageBoxW(None, "程序正在启动，请稍候…\n（无需重复打开）",
+                               "证件照批量处理工具", 0x40 | 0x00010000)  # MB_ICONINFORMATION | MB_SETFOREGROUND
+    except Exception:
+        pass
+    sys.exit(0)
+
+
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageOps
 
-from process import process_image_to_bytes, process_image, detect_face, compress_to_bytes
+from process import (process_image_to_bytes, process_image, detect_face,
+                     compress_to_bytes, check_face_model)
 
 # 标记：某图已检测过但无人脸（缓存用）
 _NO_FACE = object()
@@ -31,6 +77,13 @@ def _scale_face_result(face_r, sc):
 # ── 常量 ────────────────────────────────────────────────
 
 SUPPORTED_EXT = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+
+# 扫描输入文件夹时跳过的系统/隐藏目录，以及总数上限（防止误选 C:\ 之类的根目录）
+_SKIP_DIRS = {'$recycle.bin', 'system volume information', '__recycle',
+              'recycler', 'windows', 'program files', 'program files (x86)',
+              'programdata', 'appdata', '$windows.~ws', '$windows.~bt',
+              'node_modules', '.git', '.svn', '.hg', '__pycache__'}
+MAX_SCAN_FILES = 5000
 
 PRESET_SIZES = {
     "默认 190×260":             (190, 260),
@@ -318,21 +371,63 @@ class App(ctk.CTk):
                 self._select(0)
 
     def _load_dir(self, path):
+        """扫描输入文件夹，递归包含子文件夹里的图片。"""
         self.image_infos.clear()
         self.face_cache.clear()
-        p = Path(path)
-        for f in sorted(p.iterdir(), key=lambda x: x.name):
-            if f.suffix.lower() in SUPPORTED_EXT and f.is_file():
+        root = Path(path)
+        truncated = False
+
+        def _iter():
+            stack = [root]
+            while stack:
+                if len(self.image_infos) >= MAX_SCAN_FILES:
+                    return
+                d = stack.pop()
+                try:
+                    entries = list(os.scandir(d))
+                except OSError:
+                    continue
+                for e in entries:
+                    if e.is_dir(follow_symlinks=False):
+                        if not e.name.startswith('.') and e.name.lower() not in _SKIP_DIRS:
+                            stack.append(e.path)
+                    elif e.is_file(follow_symlinks=False) and \
+                            os.path.splitext(e.name)[1].lower() in SUPPORTED_EXT:
+                        yield e
+                        if len(self.image_infos) >= MAX_SCAN_FILES:
+                            return
+
+        for entry in _iter():
+            if len(self.image_infos) >= MAX_SCAN_FILES:
+                truncated = True
+                break
+            try:
+                p = Path(entry.path)
+                # 子文件夹里的图片显示相对路径，便于区分同名文件
+                try:
+                    rel = p.relative_to(root).as_posix()
+                except ValueError:
+                    rel = p.name
                 self.image_infos.append({
-                    "path": str(f),
-                    "name": f.name,
-                    "size": f.stat().st_size,
+                    "path": str(p),
+                    "name": rel,
+                    "size": entry.stat().st_size,
                     "status": "pending",
                 })
+            except OSError:
+                pass
+
+        self.image_infos.sort(key=lambda i: i["name"].lower())
         self._refresh_list()
         self._clear_preview()
+        if truncated:
+            messagebox.showwarning(
+                "图片过多",
+                f"该文件夹（含子文件夹）下的图片超过 {MAX_SCAN_FILES} 张，"
+                f"只载入了前 {MAX_SCAN_FILES} 张。\n请改选更具体的文件夹。")
         if self.image_infos:
             self._select(0)
+
 
     def _clear(self):
         self.image_infos.clear()
@@ -459,12 +554,18 @@ class App(ctk.CTk):
 
         # 原图 + 人脸框（复用缓存的人脸检测，避免每次预览重复算）
         orig_disp = disp.copy()
+        face_r = None
         cached = self.face_cache.get(info["path"])
+        model_err = None
         if cached is None:
             try:
                 cached = detect_face(pil) or _NO_FACE
+            except RuntimeError as e:
+                # 模型加载失败：给出可操作的中文说明，不把 OpenCV 原始报错甩给客户
+                cached = _NO_FACE
+                model_err = str(e)
             except Exception:
-                cached = _NO_FACE  # 模型缺失等异常不阻断预览
+                cached = _NO_FACE
             self.face_cache[info["path"]] = cached
         face_r = None if cached is _NO_FACE else cached
         if face_r:
@@ -491,14 +592,20 @@ class App(ctk.CTk):
                                       face_result=_scale_face_result(face_r, sc))
             data = compress_to_bytes(processed, max_size_kb=max_kb,
                                      target_w=tw, target_h=th)
-            ds2 = _calc_display((tw, th), MAX_PREVIEW_W, MAX_PREVIEW_H)
-            ctk_p = ctk.CTkImage(processed, size=ds2)
-            self.proc_lbl.configure(image=ctk_p, text="")
-            self.proc_info.configure(
-                text=f"{tw}×{th}  |  {_fmt_size(len(data))}")
         except Exception as e:
-            self.proc_lbl.configure(text=f"处理失败: {e}")
+            detail = model_err or str(e)
+            self.proc_lbl.configure(image="", text=f"处理失败：{detail}")
             self.proc_info.configure(text="")
+            return
+
+        ds2 = _calc_display((tw, th), MAX_PREVIEW_W, MAX_PREVIEW_H)
+        ctk_p = ctk.CTkImage(processed, size=ds2)
+        self.proc_lbl.configure(image=ctk_p, text="")
+        self.proc_info.configure(text=f"{tw}×{th}  |  {_fmt_size(len(data))}")
+        if model_err:
+            # 无模型时中心的兜底裁切仍然出图，但必须让客户知道这张没做人脸检测
+            self.proc_info.configure(text=f"{tw}×{th}  |  {_fmt_size(len(data))}  |  ⚠ 未启用人脸检测，构图可能不准")
+
 
     # ── 设置变更 ───────────────────────────────────────
 
@@ -543,6 +650,12 @@ class App(ctk.CTk):
         tw, th = self._read_dims()
         self.current_dims = (tw, th)
 
+        # 预检：人脸检测模型是否可用（模型不可用时整批都会失败，提前拦住）
+        ok_model, model_err = check_face_model()
+        if not ok_model:
+            messagebox.showerror("人脸检测模型不可用", model_err)
+            return
+
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
         # 预检：输出文件夹是否可写（避免整批 Permission denied）
@@ -570,6 +683,8 @@ class App(ctk.CTk):
     def _process_thread(self, out_dir, tw, th, max_kb):
         total = len(self.image_infos)
         ok = 0
+        fail = 0
+        first_err = None
 
         for i, info in enumerate(self.image_infos):
             try:
@@ -582,25 +697,35 @@ class App(ctk.CTk):
                 data = process_image_to_bytes(img, target_w=tw, target_h=th,
                                               max_size_kb=max_kb)
 
-                out_name = Path(info["name"]).with_suffix(".jpg").name
-                (Path(out_dir) / out_name).write_bytes(data)
+                # 保留相对路径（子文件夹里的图片跟着建同名子目录，避免重名互相覆盖）
+                rel = Path(info["name"].replace("/", os.sep))
+                out_path = Path(out_dir) / rel.with_suffix(".jpg")
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(data)
 
                 info["status"] = "success"
                 ok += 1
             except Exception as e:
                 info["status"] = "fail"
+                fail += 1
+                if first_err is None:
+                    first_err = str(e)
                 print(f"失败 {info['name']}: {e}")
 
             self._update_list()
 
         self._set_progress(1.0)
-        fail = total - ok
         self._set_status(f"完成: 成功 {ok}, 失败 {fail}")
-        self.after(0, self._process_done)
+        self.after(0, lambda: self._process_done(ok, fail, first_err))
 
-    def _process_done(self):
+    def _process_done(self, ok=0, fail=0, first_err=None):
         self.is_processing = False
         self.go_btn.configure(text="开始处理", state="normal")
+        # 全部失败时状态栏一句话不够，且打包成窗口程序后 print 是看不到的，必须弹框
+        if ok == 0 and fail > 0:
+            messagebox.showerror(
+                "处理失败",
+                f"{fail} 张照片全部处理失败。\n\n原因：{first_err or '未知错误'}")
 
     def _set_progress(self, val):
         self.after(0, lambda: self.pbar.set(val))
@@ -615,6 +740,7 @@ class App(ctk.CTk):
 # ── 入口 ────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    _ensure_single_instance()  # 必须在建窗口前，重复启动在这里就结束了
     ctk.set_appearance_mode("system")
     ctk.set_default_color_theme("blue")
     app = App()

@@ -1,14 +1,19 @@
 """证件照核心处理：人脸检测(YuNet) → 旋转校正 → 智能裁切 → 缩放 → 压缩"""
 
+import base64
 import io
 import math
 import os
 import sys
+import tempfile
 import threading
+import zlib
 
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
+
+import model_data  # 内嵌的 YuNet 模型（tools/embed_model.py 生成）
 
 # 默认输出参数
 DEFAULT_W = 190
@@ -38,21 +43,112 @@ _YUNET_PATH = os.path.join(_MODEL_DIR, _YUNET_MODEL)
 
 # 检测器按线程缓存，避免批量/预览并发时共享同一实例发生竞态
 _yunet_local = threading.local()
+# 模型加载失败的原因（None 表示未失败）；置位后不再反复重试
+_yunet_error = None
+
+_MODEL_HINT = ("人脸检测模型加载失败，程序无法正常裁切照片。\n"
+               "请重新运行安装程序修复；若仍然失败，请把程序安装目录加入"
+               "杀毒软件 / 安全软件的白名单后重试。")
+
+
+def _decode_embedded_model() -> bytes:
+    """解出内嵌的模型字节。"""
+    raw = zlib.decompress(base64.b64decode("".join(model_data._DATA)))
+    if len(raw) != model_data.ORIGINAL_SIZE:
+        raise RuntimeError("内嵌的人脸检测模型数据不完整")
+    return raw
+
+
+def _ensure_model_file() -> str:
+    """返回一个可用的人脸检测模型文件路径。
+
+    优先级：随包分发的 models/ 文件 → 程序目录下已落盘的模型 →
+    从内嵌数据解出并原子落盘。内嵌兜底保证即使 models/ 被杀软删除或拦截，
+    也不会出现 "Can't read ONNX file"。
+    """
+    global _yunet_error
+    if _yunet_error is not None:
+        raise RuntimeError(_yunet_error)
+
+    if os.path.isfile(_YUNET_PATH) and os.path.getsize(_YUNET_PATH) == model_data.ORIGINAL_SIZE:
+        return _YUNET_PATH
+
+    # 目标位置：优先程序（安装）目录，其次用户目录下的稳定位置
+    targets = [os.path.join(_MODEL_DIR, _YUNET_MODEL)]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        targets.append(os.path.join(local, "idphoto-processor", _YUNET_MODEL))
+
+    try:
+        raw = _decode_embedded_model()
+    except Exception as e:  # 理论上不会发生
+        _yunet_error = "%s\n（内嵌模型数据异常：%s）" % (_MODEL_HINT, e)
+        raise RuntimeError(_yunet_error) from e
+
+    last_err = None
+    for dst in targets:
+        try:
+            # 已经有完整文件就直接复用（可能由另一个实例写好）
+            if os.path.isfile(dst) and os.path.getsize(dst) == model_data.ORIGINAL_SIZE:
+                return dst
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            # 先写同目录临时文件再 os.replace 原子替换，
+            # 避免多个实例同时写同一个文件时读到写了一半的内容
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst), suffix=".part")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+                os.replace(tmp, dst)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            return dst
+        except OSError as e:
+            last_err = e
+
+    _yunet_error = "%s\n（写入失败：%s）" % (_MODEL_HINT, last_err)
+    raise RuntimeError(_yunet_error)
 
 
 def _get_yunet():
     """返回当前线程的 YuNet 检测器（懒加载并缓存）。"""
+    global _yunet_error
     det = getattr(_yunet_local, "detector", None)
     if det is None:
-        det = cv2.FaceDetectorYN.create(
-            _YUNET_PATH, "", (320, 320),
-            score_threshold=0.6, nms_threshold=0.3, top_k=5000,
-        )
+        if _yunet_error is not None:
+            raise RuntimeError(_yunet_error)
+        path = _ensure_model_file()
+        try:
+            det = cv2.FaceDetectorYN.create(
+                path, "", (320, 320),
+                score_threshold=0.6, nms_threshold=0.3, top_k=5000,
+            )
+        except Exception as e:
+            # OpenCV 加载失败时抛 cv2.error（如 "Can't read ONNX file"），
+            # 这里换成用户能看懂的说法，并把原始信息附在后面便于排查
+            _yunet_error = "%s\n（%s）" % (_MODEL_HINT, e)
+            raise RuntimeError(_yunet_error) from e
         if det is None:
-            raise RuntimeError(f"无法加载人脸检测模型：{_YUNET_PATH}\n"
-                               f"请确认 models/{_YUNET_MODEL} 存在（随 EXE 一起分发）。")
+            _yunet_error = "%s\n（模型文件：%s）" % (_MODEL_HINT, path)
+            raise RuntimeError(_yunet_error)
         _yunet_local.detector = det
     return det
+
+
+def check_face_model():
+    """自检：人脸检测模型是否可用。供 GUI 在批量处理前做预检。
+
+    返回 (是否可用, 错误信息或 None)。首次调用会真正加载模型。
+    """
+    try:
+        _get_yunet()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
 
 
 def _rotate_point(pt_x, pt_y, angle_deg, orig_w, orig_h, rot_w, rot_h):

@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 .venv/
 debug.log
+installer/out/

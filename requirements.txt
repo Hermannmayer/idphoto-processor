@@ -1,3 +1,4 @@
 Pillow>=10.0.0
-opencv-python>=4.8.0
+# 上界锁到 6：CI 会拉最新版，实测 5.0.0 与本项目兼容，但加个上界避免将来大版本意外破坏
+opencv-python>=4.8.0,<6
 customtkinter>=5.2.0
