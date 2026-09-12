@@ -10,6 +10,14 @@
 import os
 import sys
 
+# Windows / CI 上 stdout 可能不是 UTF-8（英文版 runner 是 cp1252），
+# 会让下面的中文 print 直接抛 UnicodeEncodeError
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
