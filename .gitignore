@@ -6,3 +6,6 @@ __pycache__/
 .venv/
 debug.log
 installer/out/
+_tmp/
+# 本机专属的权限设置，不进仓库（.claude/launch.json 是共享的前端预览配置，要提交）
+.claude/settings.local.json

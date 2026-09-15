@@ -8,9 +8,16 @@ PyInstaller spec for idphoto-processor (GUI)。
 
 关键处理：
 1. collect_all('numpy') — 避免 "Importing the numpy C-extensions failed"
-2. collect_all('PIL') / collect_all('customtkinter') — 自动收集插件和动态导入
+2. collect_all('PIL') — 自动收集图像格式插件与动态导入
 3. models/ 目录 — YuNet 人脸检测 ONNX 模型（另有 model_data.py 内嵌兜底）
-4. 剔除 ffmpeg 视频库与 AVIF 编解码 — 本程序只处理静态图片，用不到
+4. web/ 目录 — 前端静态页（pywebview 从这一目录提供服务）
+5. 剔除 ffmpeg 视频库与 AVIF 编解码 — 本程序只处理静态图片，用不到
+6. 剔除 Qt 系与 PyGObject — PyInstaller 会把装了的包全打进去，即使 pywebview
+   走的是 EdgeChromium 后端（浏览器内核由系统的 WebView2 提供，不随包分发）
+
+pywebview 与 pythonnet 都通过 pyinstaller40 入口点自带 hook（分别收集
+webview/lib 的 WebView2 程序集、以及 pythonnet/runtime 的 CLR 托管 DLL），
+PyInstaller 会自动发现，这里不需要再写 collect_all / runtime hook。
 """
 from PyInstaller.utils.hooks import collect_all
 
@@ -22,11 +29,10 @@ _DROP_PATTERNS = ("opencv_videoio_ffmpeg", "_avif", "libavif", "libaom", "aom-")
 
 datas = [
     ("models", "models"),  # YuNet 人脸检测 ONNX 模型
+    ("web", "web"),        # 前端静态页（index.html / style.css / app.js）
 ]
 binaries = []
-hiddenimports = [
-    "PIL._tkinter_finder",
-]
+hiddenimports = []
 
 # ── numpy: 必须 collect_all，否则 C 扩展无法加载 ──
 tmp_ret = collect_all("numpy")
@@ -40,16 +46,18 @@ datas += tmp_ret[0]
 binaries += tmp_ret[1]
 hiddenimports += tmp_ret[2]
 
-# ── customtkinter ──
-tmp_ret = collect_all("customtkinter")
-datas += tmp_ret[0]
-binaries += tmp_ret[1]
-hiddenimports += tmp_ret[2]
-
 # ── opencv-python 隐藏依赖 ──
 hiddenimports += [
     "cv2",
     "cv2.data",
+]
+
+# PyInstaller 会把环境里装了的包全部收进来，哪怕 pywebview 根本不用它们。
+# 这些是 Qt / PyGObject 系（pywebview 走 EdgeChromium 后端，用不到）。
+_EXCLUDES = [
+    "PyQt5", "PyQt6", "PySide2", "PySide6",
+    "gi",          # PyGObject（Linux 后端）
+    "tkinter",     # 界面已换成 pywebview，不再需要 Tk
 ]
 
 a = Analysis(
@@ -61,7 +69,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=_EXCLUDES,
     noarchive=False,
     optimize=0,
 )
@@ -82,6 +90,13 @@ print("[spec] dropped %d unused entries (ffmpeg video lib / AVIF codec)"
       % (_before - len(a.binaries) - len(a.datas)))
 
 pyz = PYZ(a.pure)
+
+# 应用图标：由 tools/make_icon.py 从 assets/icon-source.png 生成多尺寸 .ico。
+# 文件不存在时留空，避免还没放图标就构建失败。
+import os as _os
+_ICON = _os.path.join(SPECPATH, "assets", "icon.ico")
+_ICON_ARG = _ICON if _os.path.isfile(_ICON) else None
+print("[spec] app icon: %s" % (_ICON if _ICON_ARG else "NOT FOUND, using default"))
 
 exe = EXE(
     pyz,
@@ -105,6 +120,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=_ICON_ARG,
 )
 
 coll = COLLECT(

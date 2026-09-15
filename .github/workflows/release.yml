@@ -37,6 +37,25 @@ jobs:
       - name: Build EXE (onedir)
         run: pyinstaller --clean --noconfirm ${{ env.APP_NAME }}.spec
 
+      # 打包漏收 web/ 或 WebView2 程序集时不会报错，只会白屏 / 窗口起不来 —— 这里挡住
+      - name: Verify bundled assets
+        shell: pwsh
+        run: |
+          $root = "dist/${{ env.APP_NAME }}/_internal"
+          $need = @(
+            "$root/web/index.html",
+            "$root/web/style.css",
+            "$root/web/app.js",
+            "$root/pythonnet/runtime/Python.Runtime.dll",
+            "$root/webview/lib/Microsoft.Web.WebView2.Core.dll",
+            "$root/webview/lib/Microsoft.Web.WebView2.WinForms.dll"
+          )
+          $missing = $need | Where-Object { -not (Test-Path $_) }
+          if ($missing.Count -gt 0) {
+            throw "打包产物缺少：`n$($missing -join "`n")"
+          }
+          echo "bundled assets OK"
+
       # windows-latest 自 2025-09 起不再预装 Inno Setup，需要自己装一份
       - name: Install Inno Setup
         shell: pwsh

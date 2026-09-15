@@ -16,6 +16,16 @@
 ; 固定 AppId：升级时 Inno 靠它识别出旧版本并原地覆盖，而不是又装一份
 #define AppId "{{8F3A2C41-9E7B-4D52-B0A6-1C5E7D9F2A33}"
 
+; 应用图标由 tools/make_icon.py 从 assets/icon-source.png 生成。
+; 文件不存在就跳过，避免还没放图标时构建失败。
+; 桌面 / 开始菜单快捷方式用的是 exe 内嵌的图标（PyInstaller 已打进去），
+; 这里的 SetupIconFile 只影响安装程序自身。
+;
+; ⚠️ IconFile 必须是**纯字符串**宏。若写成表达式（AddBackslash(...) + "..."），
+; {#IconFile} 展开出来的会是表达式文本而不是求值结果，SetupIconFile 就成了废路径，
+; ISCC 会直接编译失败。路径交给 Inno 自己按脚本所在目录解析（相对路径即相对 .iss）。
+#define IconFile "..\assets\icon.ico"
+
 [Setup]
 AppId={#AppId}
 AppName={#AppName}
@@ -25,6 +35,9 @@ AppPublisher={#AppName}
 DefaultDirName=C:\IDPhotoProcessor
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
+#if FileExists(AddBackslash(SourcePath) + IconFile)
+SetupIconFile={#IconFile}
+#endif
 ; 装到 C:\ 根目录需要管理员权限（会弹一次 UAC，属正常安装行为）
 PrivilegesRequired=admin
 OutputDir=out

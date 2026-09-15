@@ -9,7 +9,11 @@
 - **人脸大小归一化** — 不同距离拍摄的照片输出后中人脸占比一致
 - **智能裁切** — 以人脸为中心，预留肩部空间
 - **自动压缩** — 二分法调整 JPEG quality，保证文件大小符合要求
-- **图形界面** — 文件夹选择、批量处理、原图/处理后对比预览
+- **拖拽导入** — 照片文件或整个文件夹直接拖进窗口
+- **源图比例校正**（可选，默认关）— 把被压扁/拉长的源图按目标宽高比横向拉伸还原，
+  再送入人脸检测与裁切；每张图按自身原始比例各算各的拉伸倍率
+- **图形界面** — 原生桌面窗口（pywebview + 系统 WebView2）、文件夹选择、批量处理、
+  原图/处理后对比预览、左右方向键切图
 - **子文件夹递归** — 选择输入文件夹时，子文件夹里的照片也会一并载入
 - **单实例运行** — 重复双击图标只会激活已有窗口，不会开出多个实例
 
@@ -32,7 +36,11 @@ pip install -r requirements.txt
 python gui.py
 ```
 
-依赖：Pillow, opencv-python, customtkinter
+依赖：Pillow, opencv-python-headless, pywebview
+
+> 界面是 pywebview 创建的原生窗口（Windows 上是 WinForms 宿主 + 系统自带的
+> WebView2），前端为 `web/` 下的静态页面。Windows 11 与 Windows 10 1803+
+> 均已预装 WebView2 运行时；更老的系统或 LTSC 版需要另行安装。
 
 > 人脸检测依赖 YuNet 模型 `models/face_detection_yunet_2023mar.onnx`（约 230 KB）。
 > 该模型同时以 base64 内嵌在 `model_data.py` 中，**即便 `models/` 目录缺失或被杀毒软件
@@ -55,11 +63,15 @@ python gui.py
 python gui.py
 ```
 
-1. 选择输入文件夹或点击「添加图片」
-2. 选择输出文件夹
+1. 把照片或整个文件夹拖进左栏，或点「选择文件」/「选文件夹」
+2. 在底部选好输出文件夹
 3. 选择预设尺寸（小1寸/1寸/大一寸/小2寸/2寸/大2寸/自定义）
 4. 设置最大文件大小
-5. 点击「开始处理」
+5. 要校正被压扁的源图时，打开「源图比例校正」并选目标比例（3:4 / 2:3 / 4:5 / 9:16 / 1:1），
+   可用滑块微调；开关关闭时该行自动隐藏
+6. 点击「开始处理」
+
+> 左右方向键可快速切换上一张 / 下一张。
 
 ### 命令行
 
@@ -89,18 +101,48 @@ python batch.py input_dir/ -o output_dir/ --overwrite
 ## 项目结构
 
 ```
-├── process.py              # 核心处理：人脸检测 → 旋转校正 → 裁切 → 压缩
+├── process.py              # 核心处理：人脸检测 → 旋转校正 → 裁切 → 压缩（含比例校正）
 ├── batch.py                # 命令行批量处理
-├── gui.py                  # 图形界面（CustomTkinter）
+├── gui.py                  # 桌面外壳（pywebview 原生窗口 + js_api）
+├── web/                    # 前端静态页（无构建步骤、不依赖 CDN，可离线运行）
+│   ├── index.html
+│   ├── style.css           # 新拟物样式与设计 token
+│   └── app.js              # 交互 + 与 Python 的桥接
 ├── model_data.py           # 内嵌的 YuNet 模型（由 tools/embed_model.py 生成）
 ├── models/                 # YuNet 人脸检测模型原始文件
+├── assets/                 # 应用图标（原图 + 由 make_icon.py 生成的 .ico）
 ├── tools/
 │   ├── embed_model.py      # 把 models/ 下的模型重新内嵌进 model_data.py
-│   └── smoke_test.py       # 打包前自检：依赖 / 模型 / 流水线
+│   ├── make_icon.py        # 从 assets/icon-source.png 生成多尺寸 icon.ico
+│   ├── smoke_test.py       # 打包前自检：依赖 / 资源 / 模型 / 流水线（CI 会跑）
+│   ├── api_test.py         # 后端集成测试：扫描 / 预览 / 比例校正 / 批量出图
+│   └── ui_check.py         # 起真实窗口，双向验证桥接并留截图（改界面后用）
 ├── installer/
 │   └── app.iss             # Inno Setup 安装包脚本
 ├── requirements.txt
 └── idphoto-processor.spec  # PyInstaller 打包配置（onedir）
+```
+
+## 调试
+
+打包版是 `console=False`，`print` 和 stderr 会被完全丢弃。排查客户机上的问题时，
+设一个环境变量就能拿到完整日志：
+
+```bash
+set IDPHOTO_LOG=%TEMP%\idphoto.log && IDPhotoProcessor.exe
+```
+
+改界面时可用的自检（两者都不需要打包）：
+
+```bash
+python tools/smoke_test.py   # 几秒钟：依赖 / pywebview 资源 / 前端文件 / 模型 / 流水线
+python tools/ui_check.py     # 起真实窗口，验证 js_api 双向通、布局无溢出，并留下截图
+```
+
+前端是纯静态页，调样式时不用启动 Python —— 起个静态服务直接在浏览器里改即可：
+
+```bash
+python -m http.server 8777 --directory web
 ```
 
 ## 打包

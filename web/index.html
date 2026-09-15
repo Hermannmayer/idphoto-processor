@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data: blob:; style-src 'self'">
+<title>证件照批量处理工具</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ── 标题栏 ───────────────────────────────────────────────────────────────
+     拖拽区只覆盖标题文字那一侧，窗口按钮留在外面：pywebview 的拖拽是沿 DOM
+     向上查找命中的，按钮若在拖拽区内，按下会同时触发窗口拖动和按钮点击。 -->
+<header class="titlebar">
+  <div class="titlebar-drag pywebview-drag-region">
+    <span class="title">证件照批量处理工具</span>
+  </div>
+  <div class="winbtns">
+    <button id="btnMin"   class="winbtn" title="最小化" aria-label="最小化"><i class="g g-min"></i></button>
+    <button id="btnMax"   class="winbtn" title="最大化" aria-label="最大化"><i class="g g-max"></i></button>
+    <button id="btnClose" class="winbtn winbtn-close" title="关闭" aria-label="关闭"><i class="g g-close"></i></button>
+  </div>
+</header>
+
+<main class="app">
+
+  <!-- ── 左栏：导入 ──────────────────────────────────────────────── -->
+  <section class="col card">
+    <h2 class="sec">① 导入</h2>
+
+    <div id="dropzone" class="dropzone">
+      <strong>把照片拖到这里</strong>
+      <span>图片文件或整个文件夹都行</span>
+    </div>
+
+    <div class="row2">
+      <button id="btnPickFiles" class="btn">选择文件</button>
+      <button id="btnPickDir"   class="btn">选文件夹</button>
+    </div>
+
+    <div class="divider"></div>
+
+    <h3 class="sub">图片列表 <span id="listCount" class="muted">0 张</span></h3>
+    <div id="list" class="list"></div>
+
+    <button id="btnRemove" class="btn btn-sm" disabled>移除选中</button>
+  </section>
+
+  <!-- ── 右栏：预览与处理 ────────────────────────────────────────── -->
+  <section class="col col-main card">
+    <div class="previews">
+      <figure class="preview">
+        <figcaption>原图</figcaption>
+        <div class="shot"><img id="imgOrig" alt=""></div>
+        <div id="infoOrig" class="info"></div>
+      </figure>
+      <figure class="preview">
+        <figcaption>处理后</figcaption>
+        <div class="shot"><img id="imgProc" alt=""></div>
+        <div id="infoProc" class="info"></div>
+      </figure>
+    </div>
+
+    <div class="nav">
+      <button id="btnPrev" class="btn btn-icon" disabled aria-label="上一张">◀</button>
+      <span id="navLabel" class="nav-label">未选图片</span>
+      <button id="btnNext" class="btn btn-icon" disabled aria-label="下一张">▶</button>
+    </div>
+
+    <button id="btnRun" class="btn btn-primary btn-lg">开 始 处 理</button>
+
+    <div class="progress"><div id="bar" class="bar"></div></div>
+    <div id="status" class="status">就绪</div>
+  </section>
+</main>
+
+<!-- ── 底部参数栏 ────────────────────────────────────────────────── -->
+<footer class="params card">
+  <div class="prow">
+    <label class="lbl" for="inOut">输出</label>
+    <input id="inOut" class="input path" type="text" readonly placeholder="选择输出文件夹…">
+    <button id="btnOutDir" class="btn btn-mini">选择</button>
+    <span class="vsep"></span>
+
+    <span class="lbl" id="sizeLabel">尺寸</span>
+    <!-- 自绘下拉：原生 <select> 的弹出列表由浏览器/系统绘制，CSS 管不到，
+         会冒出系统默认的蓝色高亮，一眼就露馅 -->
+    <div id="sizeDd" class="dropdown" tabindex="0" role="combobox"
+         aria-haspopup="listbox" aria-expanded="false" aria-labelledby="sizeLabel">
+      <span id="sizeValue" class="dd-label"></span>
+      <i class="dd-caret"></i>
+      <div id="sizeList" class="dd-list" role="listbox" hidden></div>
+    </div>
+
+    <label class="lbl" for="inW">宽</label>
+    <input id="inW" class="input num" type="text" inputmode="numeric">
+    <span class="muted">×</span>
+    <label class="lbl" for="inH">高</label>
+    <input id="inH" class="input num" type="text" inputmode="numeric">
+
+    <label class="lbl" for="inKB">最大</label>
+    <input id="inKB" class="input num" type="text" inputmode="numeric">
+    <span class="muted">KB</span>
+
+    <span class="grow"></span>
+
+    <label class="switch" title="把被压扁的源图按目标比例横向拉伸还原后再处理">
+      <input id="chkRatio" type="checkbox">
+      <span class="track"><span class="knob"></span></span>
+      <span class="switch-text">源图比例校正</span>
+    </label>
+  </div>
+
+  <div id="ratioRow" class="prow ratio-row" hidden>
+    <div id="ratioPresets" class="presets" role="group" aria-label="源图目标宽高比"></div>
+    <input id="ratioRange" class="range" type="range"
+           min="0.85" max="1.15" step="0.01" value="1" aria-label="拉伸倍率微调">
+    <span id="ratioOut" class="ratio-out">横向 ×1.00</span>
+  </div>
+</footer>
+
+<!-- ── 应用内提示框（新拟物）────────────────────────────────────────────── -->
+<div id="modal" class="modal" hidden>
+  <div class="modal-card card">
+    <h3 id="modalTitle" class="modal-title"></h3>
+    <p id="modalMsg" class="modal-msg"></p>
+    <button id="modalOk" class="btn btn-primary">知道了</button>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

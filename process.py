@@ -28,6 +28,11 @@ MAX_ROTATE_DEG = 45.0     # 超过该角度视为侧脸/异常，不校正
 EYE_LEVEL_TOL = 0.02      # 规范校验：双眼高度差 ≤ 0.02H（超过才需要旋转摆正）
 DETECT_MAX = 640          # 检测用图最长边上限（人脸检测无需原图分辨率，能大幅提速）
 
+# 比例校正：把被压扁/拉长的源图横向拉伸还原，必须在人脸检测之前做（拉伸会改变坐标空间）
+STRETCH_MIN = 0.5         # 横向倍率下限，防止异常参数把图拉成一条
+STRETCH_MAX = 2.0         # 横向倍率上限
+STRETCH_EPS = 0.005       # 与 1.0 的差异小于此值视为无需校正（必须小于滑块步进的一半）
+
 # 由眼距 d 推导头部区域的系数（对真人证件照实测校准：眼线→发顶约 1.5-2.2d，取 2.0d 含头发）
 _HEAD_ABOVE_EYE = 2.0     # 发顶到眼线的距离 ≈ 2.0·d（含头发，宁多勿切）
 _CHIN_BELOW_MOUTH = 0.55  # 下巴到嘴角中间线的距离 ≈ 0.55·d（嘴角线在眼线下方约 1.07·d）
@@ -365,12 +370,47 @@ def compress_to_bytes(img: Image.Image, max_size_kb=DEFAULT_MAX_SIZE_KB,
                           target_w=target_w, target_h=target_h)
 
 
+def stretch_image(img: Image.Image, k: float = 1.0) -> Image.Image:
+    """按倍率 k 横向拉伸（纵向不动），用于校正被压扁/拉长的源图。
+
+    k 与 1.0 的差异小于 STRETCH_EPS 时原样返回**同一个对象**（短路，零拷贝）。
+    插值用 BICUBIC 而非 LANCZOS：拉伸是非整数倍重采样，LANCZOS 在脸部轮廓这类
+    高对比边缘会有负瓣过冲（振铃），而紧接着就是人脸检测。
+    """
+    if k is None or abs(k - 1.0) < STRETCH_EPS:
+        return img
+    w, h = img.size
+    return img.resize((max(1, int(round(w * k))), h), Image.BICUBIC)
+
+
+def stretch_factor(target_aspect: float, src_w: int, src_h: int,
+                   fine: float = 1.0) -> float:
+    """由「目标宽高比 + 微调系数」算出横向拉伸倍率，并夹到安全区间。
+
+    ⚠️ src_w / src_h 必须是 **EXIF 转正之后**的尺寸：手机竖拍的 orientation 6/8
+    会交换宽高，直接用 Image.open() 的原始 size 会把该拉宽的算成该拉高。
+
+    每张图各算各的 —— 用户的意图是「都拉成同一个比例」，绝对倍率不能跨图复用
+    （各张源图的原始比例本来就不同）。
+    """
+    if not src_w or not src_h or not target_aspect:
+        return 1.0
+    k = (target_aspect / (src_w / src_h)) * fine
+    return max(STRETCH_MIN, min(STRETCH_MAX, k))
+
+
 def process_image(img: Image.Image, target_w=DEFAULT_W, target_h=DEFAULT_H,
                   head_ratio=HEAD_RATIO, head_top=HEAD_TOP,
-                  face_result=None) -> Image.Image:
+                  face_result=None, stretch: float = 1.0) -> Image.Image:
     """处理单张图片，返回符合要求的 Image 对象。
 
-    face_result 可传入 detect_face() 的结果以跳过重复检测（预览复用）。
+    face_result 可传入 detect_face() 的结果以跳过重复检测（预览复用）。该结果
+    **必须与 img 处于同一坐标空间**，因此与 stretch != 1.0 互斥 —— 调用方应自己
+    先 stretch_image() 再检测，然后把 stretch 保持为 1.0 传进来。
+
+    stretch 是横向拉伸倍率（见 stretch_factor），在 EXIF 转正之后、人脸检测之前
+    生效：这样 _detect_face 产出的一切坐标天然自洽，下游所有几何计算（裁切窗口、
+    _fit_crop_in_content 的无白边约束）也自动落在拉伸后的坐标空间里。
     """
     img = ImageOps.exif_transpose(img) or img
 
@@ -381,7 +421,13 @@ def process_image(img: Image.Image, target_w=DEFAULT_W, target_h=DEFAULT_H,
         img = background
     elif img.mode != "RGB":
         img = img.convert("RGB")
-    orig_w, orig_h = img.size
+
+    if stretch is not None and abs(stretch - 1.0) >= STRETCH_EPS and face_result is not None:
+        # 宁可当场炸，也不要让检测框悄悄对偏（那种错用户只会觉得「偶尔不准」）
+        raise ValueError("face_result 与 stretch 不能同时使用：请先 stretch_image() 再检测")
+    img = stretch_image(img, stretch)
+
+    orig_w, orig_h = img.size          # 必须在拉伸之后再读，下游几何全依赖它
 
     if face_result is None:
         face_result = _detect_face(img)
@@ -454,10 +500,11 @@ def process_image(img: Image.Image, target_w=DEFAULT_W, target_h=DEFAULT_H,
 
 def process_image_to_bytes(img: Image.Image, target_w=DEFAULT_W, target_h=DEFAULT_H,
                            max_size_kb=DEFAULT_MAX_SIZE_KB, head_ratio=HEAD_RATIO,
-                           head_top=HEAD_TOP, face_result=None) -> bytes:
-    """处理并压缩，返回 JPEG bytes。"""
+                           head_top=HEAD_TOP, face_result=None,
+                           stretch: float = 1.0) -> bytes:
+    """处理并压缩，返回 JPEG bytes。stretch 语义见 process_image()。"""
     processed = process_image(img, target_w=target_w, target_h=target_h,
                               head_ratio=head_ratio, head_top=head_top,
-                              face_result=face_result)
+                              face_result=face_result, stretch=stretch)
     return _compress_jpeg(processed, max_size_kb * 1024,
                           target_w=target_w, target_h=target_h)

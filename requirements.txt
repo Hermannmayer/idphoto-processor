@@ -1,4 +1,6 @@
 Pillow>=10.0.0
 # 上界锁到 6：CI 会拉最新版，实测 5.0.0 与本项目兼容，但加个上界避免将来大版本意外破坏
-opencv-python>=4.8.0,<6
-customtkinter>=5.2.0
+# headless：界面改由 pywebview 渲染，不再需要 cv2 自带的 GUI（能省下 Qt 那一坨）
+opencv-python-headless>=4.8.0,<6
+# 桌面外壳：Win32 原生窗口 + 内嵌 WebView2，浏览器内核由系统提供、不随包分发
+pywebview~=6.2

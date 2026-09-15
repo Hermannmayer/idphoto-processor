@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
-"""证件照批量处理 GUI"""
+"""证件照批量处理 —— 桌面外壳。
 
+窗口由 pywebview 创建（Windows 上是 WinForms 宿主 + 内嵌 WebView2 原生窗口，
+由系统提供浏览器内核，不随包分发）。界面是 web/ 下的静态页面，通过 js_api
+调回本进程；进度用 evaluate_js 推回前端。
+
+入口文件名保持 gui.py 不变 —— PyInstaller spec、Inno Setup 的 AppExeName 与
+CI 的 APP_NAME 都依赖它。
+"""
+
+import base64
 import ctypes
+import io
+import logging
 import os
 import sys
 import threading
+from collections import OrderedDict
 from pathlib import Path
-from tkinter import filedialog, messagebox
 
 # ── 单实例守卫 ──────────────────────────────────────────
-# 必须放在 customtkinter / process（opencv）等重导入之前：安装版启动时这些导入
-# 要花明显时间，低配机上客户等不及会反复双击图标，从而开出多个窗口各处理一遍。
-# 这里在最早的时机拦掉重复启动，第二个实例几乎零开销退出。
+# 必须放在 webview（pythonnet / clr）与 process（opencv）等重导入之前：
+# 安装版启动时这些导入要花明显时间，低配机上用户等不及会反复双击图标，
+# 从而开出多个窗口各处理一遍。这里在最早的时机拦掉重复启动。
 _MUTEX_NAME = "IDPhotoProcessor_SingleInstance_v1"
 _WINDOW_TITLE = "证件照批量处理工具"
 _mutex_handle = None  # 必须由模块级变量持有到进程结束，否则互斥体提前释放
+_DND_ERROR = None     # 拖拽注册失败的原因（None 表示成功），供自检与排障用
 
 
 def _ensure_single_instance():
@@ -41,47 +53,35 @@ def _ensure_single_instance():
             user32.ShowWindow(hwnd, 9)  # SW_RESTORE
             user32.SetForegroundWindow(hwnd)
         else:
-            # 第一个实例还在启动中（低配机上这段窗口期很长），
-            # 明确告诉客户"已经在启动了"，避免他以为没反应而继续点。
-            # MB_SETFOREGROUND 让提示框一定跳到前台。
+            # 第一个实例还在启动中，明确告诉用户"已经在启动了"，避免他以为没反应
             user32.MessageBoxW(None, "程序正在启动，请稍候…\n（无需重复打开）",
-                               "证件照批量处理工具", 0x40 | 0x00010000)  # MB_ICONINFORMATION | MB_SETFOREGROUND
+                               _WINDOW_TITLE, 0x40 | 0x00010000)  # MB_ICONINFORMATION | MB_SETFOREGROUND
     except Exception:
         pass
     sys.exit(0)
 
 
-import customtkinter as ctk
-from PIL import Image, ImageDraw, ImageOps
+import webview  # noqa: E402
+from PIL import Image, ImageDraw, ImageOps  # noqa: E402
 
-from process import (process_image_to_bytes, process_image, detect_face,
-                     compress_to_bytes, check_face_model)
+from process import (DEFAULT_H, DEFAULT_W, check_face_model, compress_to_bytes,  # noqa: E402
+                     detect_face, process_image, process_image_to_bytes,
+                     stretch_factor, stretch_image)
 
 # 标记：某图已检测过但无人脸（缓存用）
 _NO_FACE = object()
 
-MAX_PREVIEW_SRC = 900  # 预览处理/绘制的源图最长边上限（大幅提速，构图与批量一致）
-
-
-def _scale_face_result(face_r, sc):
-    """把 detect_face() 的结果按 sc 等比缩放到降采样图上（构图不变）。"""
-    if face_r is None:
-        return None
-    cx, cy, fh, ang, info = face_r
-    info2 = {k: tuple(v * sc for v in info[k]) for k in ("bbox", "head", "eyes", "mouth")}
-    info2["top_y"] = info["top_y"] * sc
-    info2["chin_y"] = info["chin_y"] * sc
-    info2["keypoints"] = [(x * sc, y * sc) for x, y in info.get("keypoints", [])]
-    return (cx * sc, cy * sc, fh * sc, ang, info2)
-
-# ── 常量 ────────────────────────────────────────────────
+MAX_PREVIEW_SRC = 900      # 预览处理/绘制的源图最长边上限（大幅提速，构图与批量一致）
+MAX_PREVIEW_W = 460        # 预览框显示上限（前端再按容器缩放）
+MAX_PREVIEW_H = 560
+FACE_CACHE_MAX = 32        # 人脸检测结果缓存条数（按 路径+拉伸倍率 分桶）
 
 SUPPORTED_EXT = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
 
 # 扫描输入文件夹时跳过的系统/隐藏目录，以及总数上限（防止误选 C:\ 之类的根目录）
 _SKIP_DIRS = {'$recycle.bin', 'system volume information', '__recycle',
               'recycler', 'windows', 'program files', 'program files (x86)',
-              'programdata', 'appdata', '$windows.~ws', '$windows.~bt',
+              'programdata', 'appdata', '$windows.~s', '$windows.~ws', '$windows.~bt',
               'node_modules', '.git', '.svn', '.hg', '__pycache__'}
 MAX_SCAN_FILES = 5000
 
@@ -92,295 +92,270 @@ PRESET_SIZES = {
     "大一寸 (33×48mm) 390×567": (390, 567),
     "小2寸 (35×45mm) 413×531": (413, 531),
     "2寸 (35×49mm) 413×579":   (413, 579),
-    "大2寸 (35×53mm) 413×626": (413, 626),
-    "自定义": None,
+    "大2寸 (35×53mm) 413×635": (413, 635),
+    "自定义":                   None,
 }
 
-MAX_PREVIEW_W = 380
-MAX_PREVIEW_H = 480
+# 源图比例校正的预设比值（语义：这张源图本来应该是这个宽高比）
+RATIO_PRESETS = [
+    {"label": "3:4", "value": 0.75},
+    {"label": "2:3", "value": 0.6667},
+    {"label": "4:5", "value": 0.8},
+    {"label": "9:16", "value": 0.5625},
+    {"label": "1:1", "value": 1.0},
+]
 
 
 # ── 工具 ────────────────────────────────────────────────
 
-def _fmt_size(size_bytes: int) -> str:
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    elif size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    return f"{size_bytes / 1024 / 1024:.1f} MB"
+def _fmt_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
 
 
-def _calc_display(img_size, max_w, max_h):
-    w, h = img_size
-    ratio = min(max_w / w, max_h / h, 1.0)
-    return int(w * ratio), int(h * ratio)
-
-
-def _parse_kb(text: str) -> int:
+def _parse_kb(text) -> int:
     try:
-        return int(text.strip().split()[0])
-    except (ValueError, TypeError):
+        return max(1, int(str(text).strip().split()[0]))
+    except (ValueError, TypeError, IndexError):
         return 20
 
 
-# ── 主窗口 ──────────────────────────────────────────────
+def _fit(img: Image.Image, max_w: int, max_h: int, allow_upscale: bool = False) -> Image.Image:
+    """等比缩到框内。allow_upscale=False 时只缩不放（原图预览用）。"""
+    w, h = img.size
+    r = min(max_w / w, max_h / h)
+    if not allow_upscale:
+        r = min(r, 1.0)
+    if abs(r - 1.0) < 0.01:
+        return img
+    return img.resize((max(1, round(w * r)), max(1, round(h * r))), Image.LANCZOS)
 
-class App(ctk.CTk):
-    def __init__(self):
-        super().__init__()
 
-        self.title("证件照批量处理工具")
-        self.geometry("1150x720")
-        self.minsize(900, 600)
+def _data_url(img: Image.Image) -> str:
+    """编码成 data URL。预览图很小（几百像素），走 data URL 不需要临时文件，
+    打包后也不会因为写入只读目录而失败。"""
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "JPEG", quality=88, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
-        # 状态
-        self.image_infos: list[dict] = []
-        self.selected_idx = -1
-        self.is_processing = False
-        self.current_dims = (190, 260)
-        self.face_cache: dict[str, object] = {}  # path → detect_face() 结果或 _NO_FACE
-        self._item_frames: list = []
 
-        # 构建 UI
-        self._built = False
-        self._build_ui()
-        self._built = True
+def _web_root() -> str:
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "web")
 
-        # 初始值
-        self.kb_var.set("20")
-        self.size_var.set("默认 190×260")
-        self._on_change_size("默认 190×260")
 
-    # ── 构建 UI ────────────────────────────────────────
+def _setup_logging() -> None:
+    """可选的文件日志：设 IDPHOTO_LOG=<路径> 时把关键日志写到该文件。
 
-    def _build_ui(self):
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+    打包版是 console=False，stdout / stderr 会被完全丢弃，出了问题（比如
+    pywebview 建 API 表失败）在客户机上看不到任何线索。排查时设一下这个
+    环境变量就能拿到日志，平时零开销。
 
-        self._build_top()
-        self._build_settings()
-        self._build_main()
-        self._build_bottom()
+    ⚠️ root 只开到 WARNING：开 DEBUG 会把 PIL / numpy 的逐块解码日志也灌进来，
+    一次使用就能撑出很大的文件。只把 pywebview（建窗口与 API 表）和我们自己的
+    logger 开到 DEBUG。
+    """
+    path = os.environ.get("IDPHOTO_LOG")
+    if not path:
+        return
+    try:
+        import logging
 
-    def _build_top(self):
-        f = ctk.CTkFrame(self)
-        f.grid(row=0, column=0, padx=10, pady=(10, 0), sticky="ew")
-        f.grid_columnconfigure(1, weight=1)
-        f.grid_columnconfigure(3, weight=1)
+        handler = logging.FileHandler(path, encoding="utf-8")
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        root = logging.getLogger()
+        root.setLevel(logging.WARNING)
+        root.addHandler(handler)
+        for name in ("pywebview", "idphoto"):
+            logging.getLogger(name).setLevel(logging.DEBUG)
+    except Exception:
+        pass
 
-        ctk.CTkLabel(f, text="输入:").grid(row=0, column=0, padx=(10, 3))
-        self.in_entry = ctk.CTkEntry(f, placeholder_text="选择输入文件夹，或点击右侧添加图片…")
-        self.in_entry.grid(row=0, column=1, columnspan=2, padx=3, sticky="ew")
-        ctk.CTkButton(f, text="浏览", width=65, command=self._sel_in_dir).grid(row=0, column=3, padx=3)
-        ctk.CTkButton(f, text="添加图片", width=85, command=self._add_dialog).grid(row=0, column=4, padx=(3, 10))
 
-        ctk.CTkLabel(f, text="输出:").grid(row=1, column=0, padx=(10, 3))
-        self.out_entry = ctk.CTkEntry(f, placeholder_text="选择输出文件夹…")
-        self.out_entry.grid(row=1, column=1, columnspan=2, padx=3, sticky="ew")
-        ctk.CTkButton(f, text="浏览", width=65, command=self._sel_out_dir).grid(row=1, column=3, padx=3)
+def _check_webview2() -> bool:
+    """系统里有没有 WebView2 运行时。
 
-    def _build_settings(self):
-        f = ctk.CTkFrame(self)
-        f.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+    这是本程序唯一的外部依赖 —— pywebview 靠它渲染界面（浏览器内核由系统提供，
+    不随包分发）。Win11 与 Win10 1803+ 都预装，但 LTSC / 精简版 / 长期离线的
+    机器可能没有。
 
-        ctk.CTkLabel(f, text="尺寸:", font=ctk.CTkFont(size=13)).pack(side="left", padx=(10, 2))
-        self.size_var = ctk.StringVar()
-        self.size_menu = ctk.CTkOptionMenu(
-            f, values=list(PRESET_SIZES.keys()),
-            variable=self.size_var, command=self._on_change_size,
-            width=230, dynamic_resizing=False,
-        )
-        self.size_menu.pack(side="left", padx=2)
+    ⚠️ 缺了的话 pywebview 建窗口会失败，而打包版是 console=False，什么都不会
+    显示 —— 用户只会看到「双击了没反应」。所以在这里显式检查并给一句能照着做的
+    提示，而不是让它静默失败。
+    """
+    # {F3017226-...} 是 WebView2 Runtime 在 EdgeUpdate 里的固定 GUID
+    guid = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+    try:
+        import winreg
+    except ImportError:
+        return True                      # 非 Windows：交给 pywebview 自己报错
 
-        ctk.CTkLabel(f, text="  自定义:").pack(side="left", padx=(10, 1))
-        self.cw_entry = ctk.CTkEntry(f, width=55, placeholder_text="宽")
-        self.cw_entry.pack(side="left", padx=1)
-        ctk.CTkLabel(f, text="×").pack(side="left")
-        self.ch_entry = ctk.CTkEntry(f, width=55, placeholder_text="高")
-        self.ch_entry.pack(side="left", padx=1)
-        ctk.CTkLabel(f, text="px").pack(side="left")
-
-        ctk.CTkLabel(f, text="  最大文件:", font=ctk.CTkFont(size=13)).pack(side="left", padx=(20, 2))
-        self.kb_var = ctk.StringVar(value="20")
-        self.kb_entry = ctk.CTkEntry(f, width=70, textvariable=self.kb_var)
-        self.kb_entry.pack(side="left", padx=2)
-        ctk.CTkLabel(f, text="KB").pack(side="left")
-
-        # 自定义尺寸输入变更时更新预览
-        self.cw_entry.bind("<KeyRelease>", self._on_custom_keyup)
-        self.ch_entry.bind("<KeyRelease>", self._on_custom_keyup)
-        self.kb_entry.bind("<KeyRelease>", lambda e: self._update_preview()
-                           if self.selected_idx >= 0 else None)
-
-    def _build_main(self):
-        f = ctk.CTkFrame(self)
-        f.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
-        f.grid_columnconfigure(1, weight=1)
-        f.grid_rowconfigure(0, weight=1)
-
-        # 图片列表（左）
-        left = ctk.CTkFrame(f, width=260)
-        left.grid(row=0, column=0, sticky="nsew")
-        left.grid_rowconfigure(1, weight=1)
-
-        ctk.CTkLabel(left, text="图片列表",
-                      font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(8, 0))
-        hint = "点击「添加图片」按钮添加图片"
-        ctk.CTkLabel(left, text=hint, font=ctk.CTkFont(size=11),
-                      text_color="gray").pack()
-
-        self.list_scroll = ctk.CTkScrollableFrame(left)
-        self.list_scroll.pack(fill="both", expand=True, padx=5, pady=5)
-
-        btn_row = ctk.CTkFrame(left, fg_color="transparent")
-        btn_row.pack(pady=5)
-        ctk.CTkButton(btn_row, text="清空列表", command=self._clear, width=80).pack(side="left", padx=3)
-        ctk.CTkButton(btn_row, text="全选", command=self._select_all, width=60).pack(side="left", padx=3)
-
-        # 预览（右）
-        right = ctk.CTkFrame(f)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.grid_columnconfigure((0, 1), weight=1)
-        right.grid_rowconfigure(1, weight=1)
-
-        nav = ctk.CTkFrame(right, fg_color="transparent")
-        nav.grid(row=0, column=0, columnspan=2, pady=5)
-        self.prev_btn = ctk.CTkButton(nav, text="◀", width=30, state="disabled",
-                                       command=self._prev)
-        self.prev_btn.pack(side="left", padx=2)
-        self.nav_lbl = ctk.CTkLabel(nav, text="未选图片", width=180)
-        self.nav_lbl.pack(side="left", padx=8)
-        self.next_btn = ctk.CTkButton(nav, text="▶", width=30, state="disabled",
-                                       command=self._next)
-        self.next_btn.pack(side="left", padx=2)
-
-        # 原图
-        of = ctk.CTkFrame(right)
-        of.grid(row=1, column=0, padx=4, pady=(0, 5), sticky="nsew")
-        of.grid_rowconfigure(0, weight=1)
-        oi = ctk.CTkFrame(of, fg_color="transparent")
-        oi.grid(row=0, column=0)
-        oi.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(oi, text="原图", font=ctk.CTkFont(size=13, weight="bold")).pack()
-        self.orig_lbl = ctk.CTkLabel(oi, text="")
-        self.orig_lbl.pack(padx=5, pady=5)
-        self.orig_info = ctk.CTkLabel(oi, text="", font=ctk.CTkFont(size=11), text_color="gray")
-        self.orig_info.pack()
-
-        # 处理后
-        pf = ctk.CTkFrame(right)
-        pf.grid(row=1, column=1, padx=4, pady=(0, 5), sticky="nsew")
-        pf.grid_rowconfigure(0, weight=1)
-        pi = ctk.CTkFrame(pf, fg_color="transparent")
-        pi.grid(row=0, column=0)
-        pi.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(pi, text="处理后", font=ctk.CTkFont(size=13, weight="bold")).pack()
-        self.proc_lbl = ctk.CTkLabel(pi, text="")
-        self.proc_lbl.pack(padx=5, pady=5)
-        self.proc_info = ctk.CTkLabel(pi, text="", font=ctk.CTkFont(size=11), text_color="gray")
-        self.proc_info.pack()
-
-    def _build_bottom(self):
-        f = ctk.CTkFrame(self)
-        f.grid(row=3, column=0, padx=10, pady=(0, 10), sticky="ew")
-        f.grid_columnconfigure(2, weight=1)
-
-        self.go_btn = ctk.CTkButton(f, text="开始处理", width=110, height=32,
-                                     command=self._process_all)
-        self.go_btn.grid(row=0, column=0, padx=10, pady=8)
-
-        self.pbar = ctk.CTkProgressBar(f, width=200)
-        self.pbar.grid(row=0, column=1, padx=5, pady=8)
-        self.pbar.set(0)
-
-        self.status_lbl = ctk.CTkLabel(f, text="就绪", anchor="w")
-        self.status_lbl.grid(row=0, column=2, padx=5, pady=8, sticky="ew")
-
-    # ── 读取当前输出尺寸 ────────────────────────────────
-
-    def _read_dims(self):
-        """从当前预设或自定义输入框中读取尺寸。"""
-        choice = self.size_var.get()
-        dims = PRESET_SIZES.get(choice)
-        if dims is None:  # 自定义
-            try:
-                return (int(self.cw_entry.get()), int(self.ch_entry.get()))
-            except (ValueError, TypeError):
-                return (190, 260)
-        return dims
-
-    def _on_custom_keyup(self, event=None):
-        """自定义输入框内容变化时更新 current_dims 与预览。"""
-        if self.size_var.get() != "自定义":
-            return
+    for hive, sub in (
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\\" + guid),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\EdgeUpdate\Clients\\" + guid),
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\EdgeUpdate\Clients\\" + guid),
+    ):
         try:
-            tw = int(self.cw_entry.get())
-            th = int(self.ch_entry.get())
-        except (ValueError, TypeError):
-            return
-        self.current_dims = (tw, th)
-        if self.selected_idx >= 0:
-            self._update_preview()
+            with winreg.OpenKey(hive, sub) as key:
+                if winreg.QueryValueEx(key, "pv")[0]:
+                    return True
+        except OSError:
+            continue
+    return False
 
-    # ── 文件管理 ────────────────────────────────────────
 
-    def _sel_in_dir(self):
-        d = filedialog.askdirectory(title="选择输入文件夹")
-        if not d:
-            return
-        self.in_entry.delete(0, "end")
-        self.in_entry.insert(0, d)
-        self._load_dir(d)
+def _icon_path() -> str | None:
+    """应用图标（由 tools/make_icon.py 生成）。
 
-    def _sel_out_dir(self):
-        d = filedialog.askdirectory(title="选择输出文件夹")
-        if d:
-            self.out_entry.delete(0, "end")
-            self.out_entry.insert(0, d)
+    打包版不需要它：PyInstaller 已把图标嵌进 exe，WinForms 后端在没设图标时
+    会自动从 sys.executable 提取。这个只在源码运行时用得上（否则窗口显示
+    Python 的图标）。
+    """
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(base, "assets", "icon.ico")
+    return p if os.path.isfile(p) else None
 
-    def _add_dialog(self):
-        files = filedialog.askopenfilenames(
-            title="选择图片",
-            filetypes=[("图片文件", " ".join(f"*{e}" for e in SUPPORTED_EXT)),
-                       ("所有文件", "*.*")],
-        )
-        if files:
-            self._add_files(files)
 
-    def _add_files(self, paths):
+# ── js_api：前端调进来的入口 ─────────────────────────────
+
+class Api:
+    """暴露给前端的接口。所有方法的返回值必须可 JSON 序列化。
+
+    ⚠️ pywebview 会在**独立线程**里调用这些方法，因此状态访问一律加锁，
+    且绝不能在这里直接碰 Tk/Qt 之类的 GUI 对象。
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._window = None
+
+        self._images: list[dict] = []
+        self._selected = -1
+        self._out_dir = ""
+        self._face_cache: OrderedDict = OrderedDict()
+
+        # 输出参数
+        self._size_choice = next(iter(PRESET_SIZES))
+        self._custom_w = str(DEFAULT_W)
+        self._custom_h = str(DEFAULT_H)
+        self._kb = "20"
+
+        # 比例校正
+        self._ratio_on = False
+        self._aspect = 0.75
+        self._fine = 1.0
+
+        self._running = False
+        self._cancel = False
+        self._maximized = False
+
+    # ── 状态快照 ────────────────────────────────────────
+
+    def _dims(self) -> tuple[int, int]:
+        preset = PRESET_SIZES.get(self._size_choice)
+        if preset is not None:
+            return preset
+        try:
+            return (max(1, int(self._custom_w)), max(1, int(self._custom_h)))
+        except (TypeError, ValueError):
+            return (DEFAULT_W, DEFAULT_H)
+
+    def _params_payload(self) -> dict:
+        keys = list(PRESET_SIZES.keys())
+        return {
+            "sizes": keys,
+            "sizeIndex": keys.index(self._size_choice) if self._size_choice in keys else 0,
+            "w": self._custom_w,
+            "h": self._custom_h,
+            "kb": self._kb,
+            "out": self._out_dir,
+            "ratioOn": self._ratio_on,
+            "aspect": self._aspect,
+            "fine": self._fine,
+            "presets": RATIO_PRESETS,
+        }
+
+    def _push(self, js: str) -> None:
+        """从任意线程推 JS 到前端；窗口已关时静默失败。"""
+        try:
+            if self._window:
+                self._window.evaluate_js(js)
+        except Exception:
+            pass
+
+    def _push_list(self) -> None:
+        self._push("window.pvApplyList && window.pvApplyList(%s)"
+                   % _json({"images": self._images, "selected": self._selected}))
+
+    def _push_progress(self, progress=None, status=None, running=None) -> None:
+        payload = {}
+        if progress is not None:
+            payload["progress"] = progress
+        if status is not None:
+            payload["status"] = status
+        if running is not None:
+            payload["running"] = running
+        self._push("window.pvApplyProgress && window.pvApplyProgress(%s)" % _json(payload))
+
+    # ── 前端调用：初始化 ────────────────────────────────
+
+    def init(self) -> dict:
+        with self._lock:
+            # 这条是排查"界面没反应"的第一个判断点：前端连上了才会有人调 init
+            logging.getLogger("idphoto").debug(
+                "前端已连接（init）：%d 个尺寸预设", len(PRESET_SIZES))
+            return self._params_payload()
+
+    def list(self) -> dict:
+        with self._lock:
+            return {"images": list(self._images), "selected": self._selected}
+
+    # ── 导入 ────────────────────────────────────────────
+
+    def _add_files(self, paths) -> int:
+        """追加图片（过滤扩展名、去重）。返回新增条数。"""
         added = 0
-        known = {info["path"] for info in self.image_infos}
-        for p in paths:
-            ext = os.path.splitext(p)[1].lower()
-            if ext not in SUPPORTED_EXT or p in known:
-                continue
-            try:
-                self.image_infos.append({
+        with self._lock:
+            known = {i["path"] for i in self._images}
+            for p in paths:
+                ext = os.path.splitext(p)[1].lower()
+                if ext not in SUPPORTED_EXT or p in known:
+                    continue
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                self._images.append({
                     "path": p,
                     "name": os.path.basename(p),
-                    "size": os.path.getsize(p),
+                    "size": st.st_size,
                     "status": "pending",
                 })
+                known.add(p)
                 added += 1
-            except OSError:
-                pass
+            if added and self._selected < 0:
+                self._selected = 0
+        return added
 
-        if added:
-            self._refresh_list()
-            if self.selected_idx == -1:
-                self._select(0)
-
-    def _load_dir(self, path):
+    def _load_dir(self, path) -> None:
         """扫描输入文件夹，递归包含子文件夹里的图片。"""
-        self.image_infos.clear()
-        self.face_cache.clear()
+        with self._lock:
+            self._images.clear()
+            self._face_cache.clear()
+            self._selected = -1
+
         root = Path(path)
         truncated = False
+        out = []
 
         def _iter():
             stack = [root]
             while stack:
-                if len(self.image_infos) >= MAX_SCAN_FILES:
+                if len(out) >= MAX_SCAN_FILES:
                     return
                 d = stack.pop()
                 try:
@@ -394,11 +369,11 @@ class App(ctk.CTk):
                     elif e.is_file(follow_symlinks=False) and \
                             os.path.splitext(e.name)[1].lower() in SUPPORTED_EXT:
                         yield e
-                        if len(self.image_infos) >= MAX_SCAN_FILES:
+                        if len(out) >= MAX_SCAN_FILES:
                             return
 
         for entry in _iter():
-            if len(self.image_infos) >= MAX_SCAN_FILES:
+            if len(out) >= MAX_SCAN_FILES:
                 truncated = True
                 break
             try:
@@ -408,7 +383,7 @@ class App(ctk.CTk):
                     rel = p.relative_to(root).as_posix()
                 except ValueError:
                     rel = p.name
-                self.image_infos.append({
+                out.append({
                     "path": str(p),
                     "name": rel,
                     "size": entry.stat().st_size,
@@ -417,244 +392,233 @@ class App(ctk.CTk):
             except OSError:
                 pass
 
-        self.image_infos.sort(key=lambda i: i["name"].lower())
-        self._refresh_list()
-        self._clear_preview()
+        out.sort(key=lambda i: i["name"].lower())
+        with self._lock:
+            self._images = out
+            if self._images:
+                self._selected = 0
+
         if truncated:
-            messagebox.showwarning(
-                "图片过多",
-                f"该文件夹（含子文件夹）下的图片超过 {MAX_SCAN_FILES} 张，"
-                f"只载入了前 {MAX_SCAN_FILES} 张。\n请改选更具体的文件夹。")
-        if self.image_infos:
-            self._select(0)
+            self._alert("图片过多",
+                         f"该文件夹（含子文件夹）下的图片超过 {MAX_SCAN_FILES} 张，"
+                         f"只载入了前 {MAX_SCAN_FILES} 张。\n请改选更具体的文件夹。")
 
+    def _alert(self, title: str, message: str) -> None:
+        """应用内提示框（新拟物样式）。
 
-    def _clear(self):
-        self.image_infos.clear()
-        self.face_cache.clear()
-        self.selected_idx = -1
-        self._refresh_list()
-        self._clear_preview()
+        pywebview 这一版没有 alert API，而且应用内弹窗能和整体设计保持一致，
+        比系统弹窗更合适。
+        """
+        self._push("window.pvAlert && window.pvAlert(%s, %s)"
+                   % (_json(title), _json(message)))
 
-    def _select_all(self):
-        if self.image_infos:
-            self._select(0)
+    def add_paths(self, paths) -> bool:
+        """拖拽落点：文件夹走目录扫描，图片走追加。返回列表是否变化。"""
+        dirs = [p for p in paths if os.path.isdir(p)]
+        files = [p for p in paths if os.path.isfile(p)]
 
-    # ── 图片列表 UI ────────────────────────────────────
+        if dirs:
+            self._load_dir(dirs[0])          # 拖入文件夹＝载入该目录（与原「选文件夹」一致）
+        added = self._add_files(files) if files else 0
 
-    def _refresh_list(self):
-        for w in self.list_scroll.winfo_children():
-            w.destroy()
-        self._item_frames = []
+        if not dirs and not files:
+            return False
+        self._push_list()
+        return True
 
-        if not self.image_infos:
-            ctk.CTkLabel(self.list_scroll, text="暂无图片",
-                          text_color="gray").pack(pady=30)
-            return
+    def pick_files(self) -> bool:
+        if self._running or not self._window:
+            return False
+        files = self._window.create_file_dialog(
+            webview.FileDialog.OPEN, allow_multiple=True,
+            file_types=("图片文件 (*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.tiff;*.webp)",
+                        "所有文件 (*.*)"))
+        if not files:
+            return False
+        self._add_files(files)
+        self._push_list()
+        return True
 
-        for i, info in enumerate(self.image_infos):
-            self._make_item(i, info)
+    def pick_dir(self) -> bool:
+        if self._running or not self._window:
+            return False
+        d = self._window.create_file_dialog(webview.FileDialog.FOLDER)
+        if not d:
+            return False
+        self._load_dir(d[0] if isinstance(d, (list, tuple)) else d)
+        self._push_list()
+        return True
 
-    def _set_highlight(self):
-        """仅更新选中高亮，避免每次点击都重建整列控件."""
-        for i, item in enumerate(self._item_frames):
-            item.configure(fg_color=("#d0e4f5", "#2a4a6a") if i == self.selected_idx
-                           else getattr(item, "_default_fg", None))
+    def pick_out_dir(self) -> bool:
+        if self._running or not self._window:
+            return False
+        d = self._window.create_file_dialog(webview.FileDialog.FOLDER)
+        if not d:
+            return False
+        path = d[0] if isinstance(d, (list, tuple)) else d
+        with self._lock:
+            self._out_dir = str(path)
+        self._push("window.pvSetOut && window.pvSetOut(%s)" % _json(self._out_dir))
+        return True
 
-    def _make_item(self, idx, info):
-        item = ctk.CTkFrame(self.list_scroll)
-        item.pack(fill="x", padx=2, pady=1)
-        item.grid_columnconfigure(2, weight=1)
-        item._default_fg = item.cget("fg_color")   # 记住默认色，供高亮切换恢复
-        self._item_frames.append(item)
+    def remove_selected(self) -> bool:
+        with self._lock:
+            if self._running or self._selected < 0 or self._selected >= len(self._images):
+                return False
+            del self._images[self._selected]
+            self._selected = min(self._selected, len(self._images) - 1)
+        self._push_list()
+        return True
 
-        if idx == self.selected_idx:
-            item.configure(fg_color=("#d0e4f5", "#2a4a6a"))
+    def select(self, index) -> bool:
+        with self._lock:
+            if not (0 <= index < len(self._images)):
+                return False
+            self._selected = int(index)
+        return True
 
-        st_map = {"pending": "○", "processing": "◎", "success": "✓",
-                  "fail": "✗", "skip": "–"}
-        st_color = {"pending": "gray", "processing": "#3399FF",
-                    "success": "green", "fail": "red", "skip": "orange"}
-        st = info.get("status", "pending")
+    # ── 参数 ────────────────────────────────────────────
 
-        ctk.CTkLabel(item, text=st_map.get(st, "○"),
-                      text_color=st_color.get(st, "gray"),
-                      font=ctk.CTkFont(size=14)).grid(row=0, column=0, padx=3)
+    def set_params(self, p) -> bool:
+        p = p or {}
+        with self._lock:
+            if p.get("size") in PRESET_SIZES:
+                self._size_choice = p["size"]
+            if not PRESET_SIZES.get(self._size_choice):      # 自定义
+                self._custom_w = str(p.get("w", self._custom_w))
+                self._custom_h = str(p.get("h", self._custom_h))
+            self._kb = str(p.get("kb", self._kb))
+        return True
 
-        ctk.CTkLabel(item, text=info["name"], anchor="w").grid(
-            row=0, column=1, padx=2, sticky="w")
-        ctk.CTkLabel(item, text=_fmt_size(info["size"]), width=55,
-                      anchor="e", font=ctk.CTkFont(size=11)).grid(
-            row=0, column=3, padx=3)
+    def set_ratio(self, p) -> bool:
+        p = p or {}
+        with self._lock:
+            self._ratio_on = bool(p.get("on"))
+            try:
+                self._aspect = float(p.get("aspect", self._aspect))
+            except (TypeError, ValueError):
+                pass
+            try:
+                self._fine = float(p.get("fine", self._fine))
+            except (TypeError, ValueError):
+                pass
+        return True
 
-        def on_click(e, i=idx):
-            self._select(i)
-        item.bind("<Button-1>", on_click)
-        for c in item.winfo_children():
-            c.bind("<Button-1>", on_click)
+    # ── 预览 ────────────────────────────────────────────
 
-    def _select(self, idx):
-        if idx < 0 or idx >= len(self.image_infos):
-            return
-        self.selected_idx = idx
-        self._set_highlight()
-        self._update_nav()
-        self._update_preview()
+    def _face_for(self, path: str, k: float, img: Image.Image):
+        """按 (路径, 拉伸倍率) 缓存检测结果 —— 拉伸会改变坐标空间，必须分桶。"""
+        key = (path, round(k, 3))
+        with self._lock:
+            if key in self._face_cache:
+                self._face_cache.move_to_end(key)
+                return self._face_cache[key]
 
-    def _update_nav(self):
-        n = len(self.image_infos)
-        if n == 0:
-            self.nav_lbl.configure(text="未选图片")
-            self.prev_btn.configure(state="disabled")
-            self.next_btn.configure(state="disabled")
-            return
-        self.nav_lbl.configure(text=f"{self.selected_idx + 1} / {n}")
-        self.prev_btn.configure(state="normal" if self.selected_idx > 0 else "disabled")
-        self.next_btn.configure(state="normal" if self.selected_idx < n - 1 else "disabled")
+        err = None
+        try:
+            res = detect_face(img) or _NO_FACE
+        except RuntimeError as e:
+            # 模型加载失败：给出可操作的中文说明，不把 OpenCV 原始报错甩给用户
+            res, err = _NO_FACE, str(e)
+        except Exception:
+            res = _NO_FACE
 
-    def _prev(self):
-        if self.selected_idx > 0:
-            self._select(self.selected_idx - 1)
+        with self._lock:
+            self._face_cache[key] = (res, err)
+            while len(self._face_cache) > FACE_CACHE_MAX:
+                self._face_cache.popitem(last=False)
+        return res, err
 
-    def _next(self):
-        if self.selected_idx < len(self.image_infos) - 1:
-            self._select(self.selected_idx + 1)
-
-    def _clear_preview(self):
-        self.orig_lbl.configure(image="", text="")
-        self.proc_lbl.configure(image="", text="")
-        self.orig_info.configure(text="")
-        self.proc_info.configure(text="")
-        self.nav_lbl.configure(text="未选图片")
-        self.prev_btn.configure(state="disabled")
-        self.next_btn.configure(state="disabled")
-
-    # ── 预览 ───────────────────────────────────────────
-
-    def _update_preview(self):
-        if self.selected_idx < 0:
-            return
-        info = self.image_infos[self.selected_idx]
+    def preview(self) -> dict:
+        with self._lock:
+            if not (0 <= self._selected < len(self._images)):
+                return {}
+            info = dict(self._images[self._selected])
+            ratio_on, aspect, fine = self._ratio_on, self._aspect, self._fine
+            tw, th = self._dims()
+            max_kb = _parse_kb(self._kb)
 
         try:
-            pil = Image.open(info["path"])
-            pil = ImageOps.exif_transpose(pil) or pil
+            src = Image.open(info["path"])
+            src = ImageOps.exif_transpose(src) or src
         except Exception as e:
-            self.orig_lbl.configure(text=f"无法加载: {e}")
-            return
+            return {"error": f"无法加载：{e}"}
 
-        # 预览统一在 ≤MAX_PREVIEW_SRC 的图上完成（坐标按比例缩放；构图与批量一致）
-        longest = max(pil.size)
+        # 1) 先降采样（构图与批量一致）
+        longest = max(src.size)
         if longest > MAX_PREVIEW_SRC:
             sc = MAX_PREVIEW_SRC / longest
-            disp = pil.resize((round(pil.width * sc), round(pil.height * sc)), Image.LANCZOS)
+            disp = src.resize((round(src.width * sc), round(src.height * sc)), Image.LANCZOS)
         else:
-            sc = 1.0
-            disp = pil
+            disp = src
 
-        # 原图 + 人脸框（复用缓存的人脸检测，避免每次预览重复算）
-        orig_disp = disp.copy()
-        face_r = None
-        cached = self.face_cache.get(info["path"])
-        model_err = None
-        if cached is None:
-            try:
-                cached = detect_face(pil) or _NO_FACE
-            except RuntimeError as e:
-                # 模型加载失败：给出可操作的中文说明，不把 OpenCV 原始报错甩给客户
-                cached = _NO_FACE
-                model_err = str(e)
-            except Exception:
-                cached = _NO_FACE
-            self.face_cache[info["path"]] = cached
+        # 2) 拉伸倍率用**原图转正后**的尺寸算（避免降采样取整误差，也与批量口径一致）
+        k = stretch_factor(aspect, src.width, src.height, fine) if ratio_on else 1.0
+        disp_s = stretch_image(disp, k)      # 这张就是「拉伸后的源」，原图面板显示它
+
+        # 3) 在拉伸后的图上检测，坐标天然属于同一空间
+        cached, model_err = self._face_for(info["path"], k, disp_s)
         face_r = None if cached is _NO_FACE else cached
+
+        orig_disp = disp_s.copy()
         if face_r:
             _, _, _, _, det = face_r
-            draw = ImageDraw.Draw(orig_disp)
-            hx1, hy1, hx2, hy2 = [v * sc for v in (det.get("head") or det["bbox"])]
-            draw.rectangle([hx1, hy1, hx2, hy2], outline="#00DD00", width=3)
-            r = max(2, round(4 * sc))
-            for px, py in det.get("keypoints", []):
-                draw.ellipse([px * sc - r, py * sc - r, px * sc + r, py * sc + r], fill="#FF3333")
+            box = det.get("head") or det["bbox"]
+            ImageDraw.Draw(orig_disp).rectangle(box, outline="#6d5dfc", width=3)
+            for px, py in det.get("keypoints", [])[:2]:
+                ImageDraw.Draw(orig_disp).ellipse(
+                    [px - 4, py - 4, px + 4, py + 4], fill="#c0564f")
 
-        ds = _calc_display(disp.size, MAX_PREVIEW_W, MAX_PREVIEW_H)
-        ctk_img = ctk.CTkImage(orig_disp, size=ds)
-        self.orig_lbl.configure(image=ctk_img, text="")
-        self.orig_info.configure(
-            text=f"{info['name']}  |  {pil.width}×{pil.height}  |  {_fmt_size(info['size'])}")
+        orig_url = _data_url(_fit(orig_disp, MAX_PREVIEW_W, MAX_PREVIEW_H))
 
-        # 处理后（在降采样图上处理，构图与批量一致）
+        # 4) 处理：这张图已经拉伸过，stretch 保持默认 1.0
         try:
-            # 每次都直接从当前来源读取尺寸（修复自定义尺寸不生效的 bug）
-            tw, th = self._read_dims()
-            max_kb = _parse_kb(self.kb_var.get())
-            processed = process_image(disp, target_w=tw, target_h=th,
-                                      face_result=_scale_face_result(face_r, sc))
-            data = compress_to_bytes(processed, max_size_kb=max_kb,
-                                     target_w=tw, target_h=th)
+            processed = process_image(disp_s, target_w=tw, target_h=th, face_result=face_r)
+            data = compress_to_bytes(processed, max_size_kb=max_kb, target_w=tw, target_h=th)
         except Exception as e:
-            detail = model_err or str(e)
-            self.proc_lbl.configure(image="", text=f"处理失败：{detail}")
-            self.proc_info.configure(text="")
-            return
+            return {"orig": orig_url,
+                    "infoOrig": f"{info['name']}  |  {src.width}×{src.height}  |  {_fmt_size(info['size'])}",
+                    "ratioText": f"横向 ×{k:.2f}",
+                    "error": model_err or str(e)}
 
-        ds2 = _calc_display((tw, th), MAX_PREVIEW_W, MAX_PREVIEW_H)
-        ctk_p = ctk.CTkImage(processed, size=ds2)
-        self.proc_lbl.configure(image=ctk_p, text="")
-        self.proc_info.configure(text=f"{tw}×{th}  |  {_fmt_size(len(data))}")
-        if model_err:
-            # 无模型时中心的兜底裁切仍然出图，但必须让客户知道这张没做人脸检测
-            self.proc_info.configure(text=f"{tw}×{th}  |  {_fmt_size(len(data))}  |  ⚠ 未启用人脸检测，构图可能不准")
+        proc_url = _data_url(_fit(processed, MAX_PREVIEW_W, MAX_PREVIEW_H, allow_upscale=True))
+        warn = "⚠ 未启用人脸检测，构图可能不准" if model_err else ""
+        return {
+            "orig": orig_url,
+            "proc": proc_url,
+            "infoOrig": f"{info['name']}  |  {src.width}×{src.height}  |  {_fmt_size(info['size'])}",
+            "infoProc": f"{tw}×{th}  |  {_fmt_size(len(data))}",
+            "ratioText": f"横向 ×{k:.2f}",
+            "warn": warn,
+        }
 
+    # ── 批量处理 ────────────────────────────────────────
 
-    # ── 设置变更 ───────────────────────────────────────
+    def run(self) -> bool:
+        with self._lock:
+            if self._running:
+                return False
+            if not self._images:
+                self._alert("提示", "请先添加图片")
+                return False
+            out_dir = self._out_dir
+            if not out_dir:
+                self._alert("提示", "请先选择输出文件夹")
+                return False
 
-    def _on_change_size(self, choice):
-        if not self._built:
-            return
-        dims = PRESET_SIZES.get(choice)
-        if dims is None:  # 自定义
-            self.cw_entry.configure(state="normal")
-            self.ch_entry.configure(state="normal")
-            self.current_dims = self._read_dims()
-        else:
-            tw, th = dims
-            self.cw_entry.configure(state="normal")
-            self.cw_entry.delete(0, "end")
-            self.cw_entry.insert(0, str(tw))
-            self.ch_entry.configure(state="normal")
-            self.ch_entry.delete(0, "end")
-            self.ch_entry.insert(0, str(th))
-            self.cw_entry.configure(state="disabled")
-            self.ch_entry.configure(state="disabled")
-            self.current_dims = dims
+            tw, th = self._dims()
+            max_kb = _parse_kb(self._kb)
+            ratio_on, aspect, fine = self._ratio_on, self._aspect, self._fine
+            self._running = True
+            self._cancel = False
 
-        if self.selected_idx >= 0:
-            self._update_preview()
-
-    # ── 批量处理 ───────────────────────────────────────
-
-    def _process_all(self):
-        if self.is_processing:
-            return
-        if not self.image_infos:
-            messagebox.showinfo("提示", "请先添加图片")
-            return
-
-        out_dir = self.out_entry.get().strip()
-        if not out_dir:
-            messagebox.showinfo("提示", "请先选择输出文件夹")
-            return
-
-        # 处理前重新读取当前尺寸（修复自定义不生效的 bug）
-        tw, th = self._read_dims()
-        self.current_dims = (tw, th)
-
-        # 预检：人脸检测模型是否可用（模型不可用时整批都会失败，提前拦住）
+        # 预检：人脸检测模型是否可用（不可用时整批都会失败，提前拦住）
         ok_model, model_err = check_face_model()
         if not ok_model:
-            messagebox.showerror("人脸检测模型不可用", model_err)
-            return
+            with self._lock:
+                self._running = False
+            self._alert("人脸检测模型不可用", model_err)
+            return False
 
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -664,84 +628,218 @@ class App(ctk.CTk):
             probe.write_bytes(b"")
             probe.unlink(missing_ok=True)
         except OSError:
-            messagebox.showwarning(
-                "输出文件夹无法写入",
-                f"无法向「{out_dir}」写入文件（可能是只读 / OneDrive 同步 / 权限问题）。\n"
-                f"请换一个普通文件夹（例如在桌面上新建一个空文件夹）后再试。")
-            return
+            with self._lock:
+                self._running = False
+            self._alert("输出文件夹无法写入",
+                         f"无法向「{out_dir}」写入文件（可能是只读 / OneDrive 同步 / 权限问题）。\n"
+                         f"请换一个普通文件夹（例如在桌面上新建一个空文件夹）后再试。")
+            return False
 
-        self.is_processing = True
-        self.go_btn.configure(text="处理中…", state="disabled")
-        self.pbar.set(0)
-
-        max_kb = _parse_kb(self.kb_var.get())
-
-        threading.Thread(target=self._process_thread,
-                         args=(out_dir, tw, th, max_kb),
+        threading.Thread(target=self._run_batch,
+                         args=(out_dir, tw, th, max_kb, ratio_on, aspect, fine),
                          daemon=True).start()
+        return True
 
-    def _process_thread(self, out_dir, tw, th, max_kb):
-        total = len(self.image_infos)
-        ok = 0
-        fail = 0
+    def _run_batch(self, out_dir, tw, th, max_kb, ratio_on, aspect, fine):
+        total = len(self._images)
+        ok = fail = 0
         first_err = None
 
-        for i, info in enumerate(self.image_infos):
-            try:
+        for i, info in enumerate(self._images):
+            with self._lock:
+                if self._cancel:
+                    break
                 info["status"] = "processing"
-                self._update_list()
-                self._set_status(f"处理中 [{i + 1}/{total}] {info['name']}")
-                self._set_progress(i / max(total, 1))
+            self._push("window.pvSetItemStatus && window.pvSetItemStatus(%d,'processing')" % i)
+            self._push_progress(progress=i / max(total, 1),
+                                status=f"处理中 [{i + 1}/{total}] {info['name']}")
 
+            try:
                 img = Image.open(info["path"])
+                # 必须先按 EXIF 转正再算倍率：手机竖拍的 orientation 6/8 会交换宽高，
+                # 用原始 size 会把该拉宽的算成该拉高
+                img = ImageOps.exif_transpose(img) or img
+                k = stretch_factor(aspect, img.width, img.height, fine) if ratio_on else 1.0
+
                 data = process_image_to_bytes(img, target_w=tw, target_h=th,
-                                              max_size_kb=max_kb)
+                                              max_size_kb=max_kb, stretch=k)
 
                 # 保留相对路径（子文件夹里的图片跟着建同名子目录，避免重名互相覆盖）
-                rel = Path(info["name"].replace("/", os.sep))
+                rel = Path(str(info["name"]).replace("/", os.sep))
                 out_path = Path(out_dir) / rel.with_suffix(".jpg")
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_bytes(data)
 
-                info["status"] = "success"
-                ok += 1
+                status, ok = "success", ok + 1
             except Exception as e:
-                info["status"] = "fail"
-                fail += 1
+                status, fail = "fail", fail + 1
                 if first_err is None:
                     first_err = str(e)
-                print(f"失败 {info['name']}: {e}")
 
-            self._update_list()
+            with self._lock:
+                info["status"] = status
+            self._push("window.pvSetItemStatus && window.pvSetItemStatus(%d,'%s')" % (i, status))
 
-        self._set_progress(1.0)
-        self._set_status(f"完成: 成功 {ok}, 失败 {fail}")
-        self.after(0, lambda: self._process_done(ok, fail, first_err))
+        with self._lock:
+            self._running = False
+        self._push_progress(progress=1.0, running=False,
+                            status=f"完成：成功 {ok}，失败 {fail}")
 
-    def _process_done(self, ok=0, fail=0, first_err=None):
-        self.is_processing = False
-        self.go_btn.configure(text="开始处理", state="normal")
-        # 全部失败时状态栏一句话不够，且打包成窗口程序后 print 是看不到的，必须弹框
+        # 全部失败时状态栏一句话不够，必须弹框说明原因
         if ok == 0 and fail > 0:
-            messagebox.showerror(
-                "处理失败",
-                f"{fail} 张照片全部处理失败。\n\n原因：{first_err or '未知错误'}")
+            self._alert("处理失败", f"{fail} 张照片全部处理失败。\n\n原因：{first_err or '未知错误'}")
 
-    def _set_progress(self, val):
-        self.after(0, lambda: self.pbar.set(val))
+    # ── 窗口控制 ────────────────────────────────────────
 
-    def _set_status(self, text):
-        self.after(0, lambda: self.status_lbl.configure(text=text))
+    def window_action(self, action) -> bool:
+        """前端窗口按钮。方法名不能叫 window —— 会和 self._window 属性冲突。"""
+        w = self._window
+        if w is None:
+            return False
+        try:
+            if action == "min":
+                w.minimize()
+            elif action == "max":
+                # 这个版本的 pywebview 没有暴露窗口最大化状态查询，用事件维护的标志
+                if self._maximized:
+                    w.restore()
+                else:
+                    w.maximize()
+            elif action == "close":
+                w.destroy()
+        except Exception:
+            return False
+        return True
 
-    def _update_list(self):
-        self.after(0, self._refresh_list)
+
+def _json(obj) -> str:
+    import json
+    return json.dumps(obj, ensure_ascii=False)
+
+
+# ── 拖拽 ────────────────────────────────────────────────
+
+def _js_api_surface_problems(api) -> list:
+    """检查 js_api 对象上有没有会被 pywebview **递归展开**的属性。
+
+    pywebview 建 API 表时会对 js_api 对象做 dir() 遍历，凡是「非下划线开头、
+    不可调用、但有 __module__」的属性都会被当成子 API 一路挖下去
+    （见 pywebview/util.py 的 get_functions）。把 Window、连接、缓存这类对象
+    直接挂成公开属性，就会一路走进 window.native → WinForms →
+    AccessibilityObject.Bounds.Empty.Empty.Empty… 递归爆栈。
+
+    ⚠️ 这个失败的**表现是静默的**：整个 API 表建不起来，界面不报错，
+    只是所有按钮都没反应。所以必须在启动时把它钉死，而不是等用户发现。
+    """
+    import inspect
+
+    problems = []
+    for name in dir(api):
+        if name.startswith("_"):
+            continue
+        attr = getattr(api, name)
+        if inspect.ismethod(attr) or inspect.isfunction(attr):
+            continue
+        problems.append(name)
+    return problems
+
+
+def _bind_drop(window, api: Api) -> bool:
+    """把原生拖放接到 Api.add_paths。返回是否注册成功。
+
+    ⚠️ JS 侧出于沙箱限制只能拿到文件名，**真实路径只有 Python 侧有**：
+    pywebview 在原生 drop 里把路径存起来，再按文件名匹配注入 pywebviewFullPath。
+    所以拖拽必须走这条 DOM 事件，不能用浏览器那套 DataTransfer。
+    """
+    global _DND_ERROR
+    try:
+        from webview.dom import DOMEventHandler
+
+        def on_drop(e):
+            files = (e.get("dataTransfer") or {}).get("files") or []
+            paths = [f.get("pywebviewFullPath") for f in files]
+            paths = [p for p in paths if p]
+            if paths:
+                api.add_paths(paths)
+
+        window.dom.document.events.drop += DOMEventHandler(on_drop, True, True)
+        _DND_ERROR = None
+        return True
+    except Exception as e:                                   # pragma: no cover
+        _DND_ERROR = "%s: %s" % (type(e).__name__, e)
+        print(f"[gui] 拖拽注册失败（不影响其它功能）：{_DND_ERROR}")
+        return False
 
 
 # ── 入口 ────────────────────────────────────────────────
 
+def build_window(api: Api, on_loaded=None):
+    """创建主窗口并把 api 接上。
+
+    ⚠️ main() 与 tools/ui_check.py 共用这一条路径。之前这里写成了
+    `api.window = window`（公开属性），触发 pywebview 递归展开把整个 API 表
+    搞崩，而测试里恰好写的是 `api._window`，两条路分叉导致没能发现。
+    现在只有这一个创建入口，且创建后立刻自检。
+    """
+    window = webview.create_window(
+        _WINDOW_TITLE,
+        url=os.path.join(_web_root(), "index.html"),
+        js_api=api,
+        width=1120, height=760, min_size=(1000, 680),
+        frameless=True,          # 配自定义标题栏做新拟物
+        easy_drag=False,         # 只让标题栏可拖，避免整窗乱拖
+        text_select=False,       # 桌面应用观感：默认不可选中文本（输入框内仍可选）
+        zoomable=False,
+        background_color="#e0e5ec",
+    )
+    api._window = window          # 必须是私有属性，见 _js_api_surface_problems
+
+    # 赋值之后再自检 —— 要检的是运行时真实状态，不是类定义
+    problems = _js_api_surface_problems(api)
+    if problems:
+        raise RuntimeError(
+            "Api 暴露了会被 pywebview 递归展开的属性 %s。"
+            "这会让整个 API 表建不起来、前端所有按钮失灵，"
+            "必须把它们改成下划线开头的私有属性。" % problems)
+
+    def _loaded():
+        _bind_drop(window, api)
+        if on_loaded:
+            on_loaded(window)
+
+    window.events.loaded += _loaded
+    # 用事件维护最大化标志，用户从别处（双击拖拽区 / Win+↑）改状态时也能同步
+    window.events.maximized += lambda: setattr(api, "_maximized", True)
+    window.events.restored += lambda: setattr(api, "_maximized", False)
+    return window
+
+
+def main():
+    _setup_logging()
+
+    # 缺 WebView2 时给一句能照着做的提示，别让用户面对「双击了没反应」
+    if not _check_webview2():
+        logging.getLogger("idphoto").error("未检测到 WebView2 运行时，无法创建窗口")
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "本程序需要 Microsoft Edge WebView2 运行时才能显示界面，当前系统未检测到。\n\n"
+                "请先安装再运行：\nhttps://go.microsoft.com/fwlink/p/?LinkId=2124703",
+                _WINDOW_TITLE, 0x30 | 0x00010000)   # MB_ICONWARNING | MB_SETFOREGROUND
+        except Exception:
+            pass
+        return
+
+    # 拖拽区只认直接命中：窗口按钮若在拖拽区内，按下会同时触发窗口拖动和按钮点击
+    webview.settings['DRAG_REGION_DIRECT_TARGET_ONLY'] = True
+
+    build_window(Api())
+
+    # debug=False：pywebview 会据此关掉 DevTools、默认右键菜单与浏览器快捷键
+    # （F5 / Ctrl+P / Ctrl+± / F12），这正是我们要的桌面应用行为
+    webview.start(debug=False, icon=_icon_path())
+
+
 if __name__ == "__main__":
     _ensure_single_instance()  # 必须在建窗口前，重复启动在这里就结束了
-    ctk.set_appearance_mode("system")
-    ctk.set_default_color_theme("blue")
-    app = App()
-    app.mainloop()
+    main()

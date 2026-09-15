@@ -38,9 +38,94 @@ def _imports():
     import cv2
     import numpy
     from PIL import Image, ImageOps, ImageDraw  # noqa: F401
-    import customtkinter  # noqa: F401
-    return "(cv2 %s, numpy %s, Pillow %s)" % (cv2.__version__, numpy.__version__,
-                                              __import__("PIL").__version__)
+    import webview  # noqa: F401
+    from importlib.metadata import version
+    return "(cv2 %s, numpy %s, Pillow %s, pywebview %s)" % (
+        cv2.__version__, numpy.__version__, __import__("PIL").__version__,
+        version("pywebview"))
+
+
+def _webview_assets():
+    """pywebview 靠 webview/lib 下的 WebView2 程序集建窗口。
+
+    打包时漏收这些文件不会报错，只会让窗口起不来或拖拽静默失效 —— 正好是
+    这个项目历史上被坑过的那一类问题（见 README 的 "Can't read ONNX file"）。
+    """
+    import webview
+
+    root = os.path.dirname(os.path.abspath(webview.__file__))
+    lib = os.path.join(root, "lib")
+    if not os.path.isdir(lib):
+        raise RuntimeError("缺少 webview/lib 目录：%s" % lib)
+    need = ("Microsoft.Web.WebView2.Core.dll", "Microsoft.Web.WebView2.WinForms.dll")
+    missing = [n for n in need if not os.path.isfile(os.path.join(lib, n))]
+    if missing:
+        raise RuntimeError("webview/lib 缺文件：%s" % ", ".join(missing))
+    return "(%s)" % ", ".join(need)
+
+
+def _web_assets():
+    """前端静态文件必须在（打包时由 spec 的 datas 收集 web/）。
+
+    漏收在运行期的表现是白屏，而不是报错 —— 正是这个脚本要挡住的那类问题。
+    """
+    need = ("index.html", "style.css", "app.js")
+    root = os.path.join(ROOT, "web")
+    missing = [n for n in need if not os.path.isfile(os.path.join(root, n))]
+    if missing:
+        raise RuntimeError("web/ 缺文件：%s" % ", ".join(missing))
+
+    # 宿主模块也要能导入 —— 它会连带加载 webview / pythonnet
+    import gui
+    if not gui._WINDOW_TITLE:
+        raise RuntimeError("宿主缺少窗口标题常量")
+    return "(%s)" % ", ".join(need)
+
+
+def _js_api():
+    """js_api 上不能有会被 pywebview 递归展开的公开属性。
+
+    pywebview 建 API 表时会 dir() 遍历 js_api 对象，把「非下划线开头、不可调用、
+    有 __module__」的属性当子 API 递归挖下去。挂个 Window 上去就会一路走进
+    WinForms 的 AccessibilityObject.Bounds.Empty.Empty… 递归爆栈。
+
+    ⚠️ 这个失败的**表现是静默的**：API 表建不起来，前端不报错，只是所有按钮失灵。
+    所以必须在打包前挡住，而不是等用户发现。
+    """
+    import gui
+
+    api = gui.Api()
+    api._window = object()          # 模拟 build_window 挂上窗口后的真实状态
+    problems = gui._js_api_surface_problems(api)
+    if problems:
+        raise RuntimeError("Api 暴露了会被递归展开的属性：%s" % problems)
+    n = len([x for x in dir(api)
+             if not x.startswith('_') and callable(getattr(api, x))])
+    return "(%d 个公开方法，无多余属性)" % n
+
+
+def _stretch():
+    """比例校正只该改源图几何，不该改最终输出尺寸。"""
+    from PIL import Image, ImageDraw
+    import process
+
+    img = Image.new("RGB", (600, 800), (235, 235, 240))
+    ImageDraw.Draw(img).ellipse([200, 250, 400, 500], fill=(230, 195, 170))
+
+    # k≈1 必须短路返回同一对象，不能白白多一次重采样
+    if process.stretch_image(img, 1.0) is not img:
+        raise RuntimeError("stretch=1.0 未走短路")
+
+    for k in (1.25, 0.8, 1.0):
+        out = process.process_image(img, target_w=190, target_h=260, stretch=k)
+        if out.size != (190, 260):
+            raise RuntimeError("stretch=%.2f 的输出尺寸变成了 %s" % (k, out.size))
+
+    # 拉伸倍率要夹在安全区间内
+    if process.stretch_factor(0.75, 600, 800, 99.0) > process.STRETCH_MAX:
+        raise RuntimeError("stretch_factor 未夹到上限")
+
+    return "(1.25 / 0.8 / 1.0 输出尺寸均正确)"
 
 
 def _model():
@@ -90,9 +175,13 @@ def _embedded_model():
 def main():
     print("冒烟自检：")
     check("依赖导入", _imports)
+    check("pywebview 资源", _webview_assets)
+    check("前端静态文件", _web_assets)
+    check("js_api 接口面", _js_api)
     check("内嵌模型一致性", _embedded_model)
     check("人脸检测模型加载", _model)
     check("处理流水线", _pipeline)
+    check("比例校正", _stretch)
 
     if failures:
         print("\n自检失败 %d 项：" % len(failures))
